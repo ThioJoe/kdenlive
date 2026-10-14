@@ -608,8 +608,11 @@ struct Track
 };
 
 /** Renders a timeline like Kdenlive's: one track per entry, the first one at
- *  the bottom, each other track composited onto it by a qtblend transition. */
-Image renderTimeline(mlt_profile profile, const std::vector<Track> &tracks, bool cpu, const Properties &frameProperties, mlt_position position = 0)
+ *  the bottom, each other track composited onto it by a qtblend transition.
+ *  With nested, each track is a tractor of two playlists, the clip on the
+ *  first one, as in Kdenlive's projects. */
+Image renderTimeline(mlt_profile profile, const std::vector<Track> &tracks, bool cpu, const Properties &frameProperties, mlt_position position = 0,
+                     bool nested = false)
 {
     mlt_tractor tractor = mlt_tractor_new();
     mlt_multitrack multitrack = mlt_tractor_multitrack(tractor);
@@ -617,13 +620,28 @@ Image renderTimeline(mlt_profile profile, const std::vector<Track> &tracks, bool
     std::vector<mlt_producer> producers;
     std::vector<mlt_filter> filters;
     std::vector<mlt_transition> transitions;
+    std::vector<mlt_playlist> playlists;
+    std::vector<mlt_tractor> trackTractors;
     for (size_t i = 0; i < tracks.size(); ++i) {
         mlt_producer producer = patternProducer(profile, tracks[i].image);
         for (mlt_filter filter : createFilters(profile, tracks[i].filters, cpu)) {
             mlt_producer_attach(producer, filter);
             filters.push_back(filter);
         }
-        mlt_multitrack_connect(multitrack, producer, int(i));
+        mlt_producer track = producer;
+        if (nested) {
+            mlt_playlist clips = mlt_playlist_new(profile);
+            mlt_playlist empty = mlt_playlist_new(profile);
+            mlt_playlist_append(clips, producer);
+            mlt_tractor trackTractor = mlt_tractor_new();
+            mlt_multitrack_connect(mlt_tractor_multitrack(trackTractor), MLT_PLAYLIST_PRODUCER(clips), 0);
+            mlt_multitrack_connect(mlt_tractor_multitrack(trackTractor), MLT_PLAYLIST_PRODUCER(empty), 1);
+            playlists.push_back(clips);
+            playlists.push_back(empty);
+            trackTractors.push_back(trackTractor);
+            track = MLT_TRACTOR_PRODUCER(trackTractor);
+        }
+        mlt_multitrack_connect(multitrack, track, int(i));
         producers.push_back(producer);
         if (i > 0) {
             mlt_transition transition = mlt_factory_transition(profile, "qtblend", nullptr);
@@ -662,6 +680,12 @@ Image renderTimeline(mlt_profile profile, const std::vector<Track> &tracks, bool
         mlt_transition_close(transition);
     }
     mlt_tractor_close(tractor);
+    for (mlt_tractor trackTractor : trackTractors) {
+        mlt_tractor_close(trackTractor);
+    }
+    for (mlt_playlist playlist : playlists) {
+        mlt_playlist_close(playlist);
+    }
     for (mlt_filter filter : filters) {
         mlt_filter_close(filter);
     }
@@ -671,10 +695,11 @@ Image renderTimeline(mlt_profile profile, const std::vector<Track> &tracks, bool
     return output;
 }
 
-void expectSameTimeline(mlt_profile profile, const std::vector<Track> &tracks, const Properties &frameProperties, const char *what, mlt_position position = 0)
+void expectSameTimeline(mlt_profile profile, const std::vector<Track> &tracks, const Properties &frameProperties, const char *what, mlt_position position = 0,
+                        bool nested = false)
 {
-    const Image cpu = renderTimeline(profile, tracks, true, frameProperties, position);
-    const Image gpu = renderTimeline(profile, tracks, false, frameProperties, position);
+    const Image cpu = renderTimeline(profile, tracks, true, frameProperties, position, nested);
+    const Image gpu = renderTimeline(profile, tracks, false, frameProperties, position, nested);
     const Difference d = compare(cpu, gpu);
     if (d.sizeMismatch) {
         check(false, "%s: output size mismatch", what);
@@ -706,6 +731,7 @@ void testCompositing(mlt_profile profile)
     for (const Properties *frameProperties : {&smooth, &nearest}) {
         expectSameTimeline(profile, pip, *frameProperties, frameProperties == &smooth ? "picture in picture, smooth" : "picture in picture, nearest");
     }
+    expectSameTimeline(profile, pip, smooth, "picture in picture, tracks in tractors", 0, true);
     // Transitions with their own geometry, opacity and rotation
     expectSameTimeline(profile,
                        {{&background, {}, {}},
@@ -728,6 +754,17 @@ void testCompositing(mlt_profile profile)
               "timeline: %llu bytes downloaded for a %llu bytes frame, %llu bytes uploaded for %llu bytes of images", (unsigned long long)stats.downloadedBytes,
               (unsigned long long)frameBytes, (unsigned long long)stats.uploadedBytes, (unsigned long long)imageBytes);
         check(stats.misuse == 0, "timeline: %llu invalid CUDA calls", (unsigned long long)stats.misuse);
+
+        // The same when each track is a tractor: the images of the clips'
+        // effects stay on the GPU across them
+        g_mock.reset();
+        const Image nestedResult = renderTimeline(profile, pip, false, smooth, 0, true);
+        const MockCudaStats nestedStats = g_mock.stats();
+        check(!nestedResult.pixels.empty() && nestedStats.downloadedBytes < frameBytes + 64 && nestedStats.uploadedBytes < imageBytes + imageBytes / 2,
+              "timeline with tracks in tractors: %llu bytes downloaded for a %llu bytes frame, %llu bytes uploaded for %llu bytes of images",
+              (unsigned long long)nestedStats.downloadedBytes, (unsigned long long)frameBytes, (unsigned long long)nestedStats.uploadedBytes,
+              (unsigned long long)imageBytes);
+        check(nestedStats.misuse == 0, "timeline with tracks in tractors: %llu invalid CUDA calls", (unsigned long long)nestedStats.misuse);
     }
 }
 
@@ -902,6 +939,19 @@ void expectSameOutput(const Output &cpu, const Output &gpu, const std::string &w
           gpu.colorspace, cpu.fullRange, gpu.fullRange);
 }
 
+Output withoutLastRows(Output output, int rows)
+{
+    if (rows > 0 && output.width > 0 && output.height > rows) {
+        const size_t rowBytes = output.data.size() / size_t(output.height);
+        output.height -= rows;
+        output.data.resize(rowBytes * size_t(output.height));
+        if (!output.alpha.empty()) {
+            output.alpha.resize(size_t(output.width) * size_t(output.height));
+        }
+    }
+    return output;
+}
+
 /** Writes a YUV4MPEG2 file of frames with random 4:2:0 content, which the
  *  avformat producer decodes as yuv420p. parameters holds stream parameters
  *  such as the interlacing ("Ip", "It"). */
@@ -978,14 +1028,18 @@ void testDecoding(mlt_profile profile)
         const char *parameters;
         Properties producer;
         bool onGpu;
+        // Rows at the bottom whose values MLT does not reproduce
+        int unreliableRows = 0;
     };
     const Case cases[] = {
         {"720p", 1280, 720, "Ip", {}, true}, // BT.709 by default
         {"pal", 720, 576, "Ip", {}, true},   // BT.601 by default
         {"interlaced", 720, 576, "It", {}, true},
         // The producer converts the fields of interlaced frames separately,
-        // which needs a height that is a multiple of 4 on the GPU
-        {"interlaced 486 lines", 720, 486, "Ib", {}, false},
+        // which needs a height that is a multiple of 4 on the GPU. With an odd
+        // field height it reads one chroma row past the planes for the last
+        // rows of the second field.
+        {"interlaced 486 lines", 720, 486, "Ib", {}, false, 3},
         {"full range", 640, 360, "Ip XCOLORRANGE=FULL", {}, true},
         {"full range interlaced", 640, 360, "It XCOLORRANGE=FULL", {}, true},
         {"odd width", 33, 20, "Ip", {}, false},
@@ -1004,7 +1058,7 @@ void testDecoding(mlt_profile profile)
         const Output gpu = decode(profile, path, false, 1, c.producer);
         const MockCudaStats stats = g_mock.stats();
         const Output cpu = decode(profile, path, true, 1, c.producer);
-        expectSameOutput(cpu, gpu, std::string("decoding ") + c.name);
+        expectSameOutput(withoutLastRows(cpu, c.unreliableRows), withoutLastRows(gpu, c.unreliableRows), std::string("decoding ") + c.name);
         if (g_mock.active()) {
             const uint64_t yuvBytes = uint64_t(c.width) * uint64_t(c.height) * 3 / 2;
             if (c.onGpu) {
@@ -1231,7 +1285,9 @@ int main(int argc, char **argv)
     }
 #endif
 
-    mlt_repository repository = mlt_factory_init(nullptr);
+    // MLT on Windows looks for its modules next to the executable and ignores
+    // MLT_REPOSITORY unless it is passed here
+    mlt_repository repository = mlt_factory_init(getenv("MLT_REPOSITORY"));
     if (!repository) {
         fprintf(stderr, "cannot initialize MLT\n");
         return 2;

@@ -17,7 +17,9 @@
  * the upper one sets kWantDevice on the frame before fetching its input, and
  * the lower one then attaches its device result to the frame (kDeviceImage)
  * instead of downloading it. The host pointer returned along with it is only
- * a tag in that case, its content is stale.
+ * a tag in that case, its content is stale. This also works across the
+ * boundary of a tractor (a Kdenlive track), whose frame hands the image of
+ * the track's frame up unchanged.
  */
 
 #include "bridge.h"
@@ -77,13 +79,66 @@ bool isBridge(void *getImage)
            getImage == reinterpret_cast<void *>(&decodeBridgeGetImage);
 }
 
-/** True if the get_image that will run after the entry at depth (0 = top) is
- *  another bridge, i.e. the next filter down the stack runs through gpufx. */
-bool nextIsBridge(mlt_frame frame, int depth)
+/** The get_image a tractor puts on its frame to fetch the image of a track's
+ *  frame, the entry below it: [track frame, get_image]. It hands that image up
+ *  unchanged, in the same buffer. It is not exported, so it is found once in
+ *  the frame of a probe tractor. */
+void *tractorGetImage()
 {
-    mlt_deque stack = MLT_FRAME_IMAGE_STACK(frame);
-    const int count = mlt_deque_count(stack);
-    return count > depth && isBridge(mlt_deque_peek(stack, count - 1 - depth));
+    static void *const getImage = []() -> void * {
+        void *result = nullptr;
+        mlt_profile profile = mlt_profile_init(nullptr);
+        mlt_producer producer = profile ? mlt_factory_producer(profile, "color", "black") : nullptr;
+        mlt_tractor tractor = producer ? mlt_tractor_new() : nullptr;
+        mlt_frame frame = nullptr;
+        if (tractor && !mlt_tractor_set_track(tractor, producer, 0) && !mlt_service_get_frame(MLT_TRACTOR_SERVICE(tractor), &frame, 0) && frame) {
+            mlt_deque stack = MLT_FRAME_IMAGE_STACK(frame);
+            void *track = mlt_deque_count(stack) == 2 ? mlt_deque_peek(stack, 0) : nullptr;
+            // The tractor keeps the track's frame in a property of its own frame
+            mlt_properties properties = MLT_FRAME_PROPERTIES(frame);
+            for (int i = 0; track && i < mlt_properties_count(properties); ++i) {
+                if (mlt_properties_get_data_at(properties, i, nullptr) == track) {
+                    result = mlt_deque_peek(stack, 1);
+                    break;
+                }
+            }
+        }
+        mlt_frame_close(frame);
+        mlt_tractor_close(tractor);
+        mlt_producer_close(producer);
+        mlt_profile_close(profile);
+        if (!result) {
+            logInfo("images cannot stay on the GPU across tracks with this version of MLT");
+        }
+        return result;
+    }();
+    return getImage;
+}
+
+/** The frame on which to request a GPU image, for the image that the
+ *  get_image at depth (0 = top) of frame's stack delivers: frame itself if
+ *  that get_image is a bridge, or the track frame below the get_image of one
+ *  or more tractors if its next get_image is one. Null if the image comes from
+ *  the CPU. */
+mlt_frame gpuSource(mlt_frame frame, int depth)
+{
+    for (int level = 0; level < 16; ++level) {
+        mlt_deque stack = MLT_FRAME_IMAGE_STACK(frame);
+        const int count = mlt_deque_count(stack);
+        void *getImage = count > depth ? mlt_deque_peek(stack, count - 1 - depth) : nullptr;
+        if (!getImage) {
+            return nullptr;
+        }
+        if (isBridge(getImage)) {
+            return frame;
+        }
+        if (count < depth + 2 || getImage != tractorGetImage()) {
+            return nullptr;
+        }
+        frame = static_cast<mlt_frame>(mlt_deque_peek(stack, count - 2 - depth));
+        depth = 0;
+    }
+    return nullptr;
 }
 
 /** The same for the image of a transition's frame, where depth is the first
@@ -91,7 +146,7 @@ bool nextIsBridge(mlt_frame frame, int depth)
  *  only sets some frame properties: [transition, get_image_a] on the bottom
  *  frame, [bottom frame, transition, get_image_b] on the top frame. The image
  *  passes through it unchanged, so the bridge below it can be used. */
-bool belowTransitionIsBridge(mlt_frame frame, int depth, mlt_transition transition, mlt_frame hookFrame)
+mlt_frame gpuSourceBelowTransition(mlt_frame frame, int depth, mlt_transition transition, mlt_frame hookFrame)
 {
     mlt_deque stack = MLT_FRAME_IMAGE_STACK(frame);
     const int count = mlt_deque_count(stack);
@@ -102,7 +157,7 @@ bool belowTransitionIsBridge(mlt_frame frame, int depth, mlt_transition transiti
             depth += 1;
         }
     }
-    return isBridge(entry(depth));
+    return gpuSource(frame, depth);
 }
 
 bool takeFlag(mlt_properties properties, const char *name)
@@ -118,6 +173,31 @@ void attachDeviceImage(mlt_properties properties, std::unique_ptr<DeviceImage> i
 {
     auto *box = new DeviceImageBox{std::move(image)};
     mlt_properties_set_data(properties, kDeviceImage, box, 0, destroyDeviceImageBox, nullptr);
+}
+
+/** mlt_frame_get_image() of frame, asking for the image on the GPU from the
+ *  bridge of source (see gpuSource()) when it is not null. A GPU image ends up
+ *  on frame, for takeDeviceImage(). */
+int fetchImage(mlt_frame frame, mlt_frame source, uint8_t **image, mlt_image_format *format, int *width, int *height, int writable)
+{
+    if (source) {
+        mlt_properties_set_int(MLT_FRAME_PROPERTIES(source), kWantDevice, 1);
+    }
+    const int error = mlt_frame_get_image(frame, image, format, width, height, writable);
+    if (source) {
+        mlt_properties sourceProperties = MLT_FRAME_PROPERTIES(source);
+        mlt_properties_set_int(sourceProperties, kWantDevice, 0);
+        auto *box = source != frame ? static_cast<DeviceImageBox *>(mlt_properties_get_data(sourceProperties, kDeviceImage, nullptr)) : nullptr;
+        if (box) {
+            // The tractors passed the image up, the GPU image goes along
+            std::unique_ptr<DeviceImage> device = std::move(box->image);
+            mlt_properties_set_data(sourceProperties, kDeviceImage, nullptr, 0, nullptr, nullptr);
+            if (device) {
+                attachDeviceImage(MLT_FRAME_PROPERTIES(frame), std::move(device));
+            }
+        }
+    }
+    return error;
 }
 
 std::unique_ptr<DeviceImage> takeDeviceImage(mlt_properties properties, const uint8_t *tag, int width, int height, mlt_image_format format)
@@ -292,7 +372,7 @@ CUresult deliverYuv422(GpuScope &scope, CUdeviceptr rgba, mlt_frame frame, int w
 }
 
 int runOnGpu(mlt_frame frame, mlt_filter filter, mlt_get_image cpuGetImage, const EffectDescriptor &effect, EffectPlan &plan, bool callerWantsDevice,
-             bool lowerOnGpu, uint8_t **image, mlt_image_format *format, int *width, int *height, int writable)
+             mlt_frame lowerSource, uint8_t **image, mlt_image_format *format, int *width, int *height, int writable)
 {
     mlt_properties properties = MLT_FRAME_PROPERTIES(frame);
     Runtime &runtime = Runtime::instance();
@@ -307,11 +387,7 @@ int runOnGpu(mlt_frame frame, mlt_filter filter, mlt_get_image cpuGetImage, cons
     int w = plan.inputWidth > 0 ? plan.inputWidth : *width;
     int h = plan.inputHeight > 0 ? plan.inputHeight : *height;
     job.beforeFetch(frame);
-    if (lowerOnGpu) {
-        mlt_properties_set_int(properties, kWantDevice, 1);
-    }
-    const int error = mlt_frame_get_image(frame, &input, &inputFormat, &w, &h, 0);
-    mlt_properties_set_int(properties, kWantDevice, 0);
+    const int error = fetchImage(frame, lowerSource, &input, &inputFormat, &w, &h, 0);
     std::unique_ptr<DeviceImage> deviceInput = takeDeviceImage(properties, input, w, h, inputFormat);
     if (error || !input) {
         *image = input;
@@ -468,16 +544,14 @@ int bridgeGetImage(mlt_frame frame, uint8_t **image, mlt_image_format *format, i
     EffectPlan plan = effect.plan(ctx);
     mlt_service_unlock(MLT_FILTER_SERVICE(filter));
 
-    const bool lowerOnGpu = nextIsBridge(frame, 1);
+    mlt_frame lowerSource = gpuSource(frame, 1);
+    const bool lowerOnGpu = lowerSource != nullptr;
     switch (plan.decision) {
     case Decision::PassThrough:
         if (callerWantsDevice && lowerOnGpu && *format == mlt_image_rgba) {
             // Nothing to do: let the image travel through on the GPU
             mlt_frame_pop_service(frame);
-            mlt_properties_set_int(properties, kWantDevice, 1);
-            const int error = mlt_frame_get_image(frame, image, format, width, height, writable);
-            mlt_properties_set_int(properties, kWantDevice, 0);
-            return error;
+            return fetchImage(frame, lowerSource, image, format, width, height, writable);
         }
         return cpuGetImage(frame, image, format, width, height, writable);
     case Decision::Cpu:
@@ -498,7 +572,7 @@ int bridgeGetImage(mlt_frame frame, uint8_t **image, mlt_image_format *format, i
     if (!Runtime::instance().ensureInitialized()) {
         return cpuGetImage(frame, image, format, width, height, writable);
     }
-    return runOnGpu(frame, filter, cpuGetImage, effect, plan, callerWantsDevice, lowerOnGpu, image, format, width, height, writable);
+    return runOnGpu(frame, filter, cpuGetImage, effect, plan, callerWantsDevice, lowerSource, image, format, width, height, writable);
 }
 
 /* ==========================================================================
@@ -620,7 +694,8 @@ CUresult deviceImageOpaque(const DeviceImage &image, bool &opaque)
 }
 
 int runTransitionOnGpu(mlt_frame aFrame, mlt_get_image cpuGetImage, const TransitionDescriptor &descriptor, TransitionPlan &plan, const TransitionContext &ctx,
-                       bool callerWantsDevice, uint8_t **image, mlt_image_format *format, int *width, int *height, int writable)
+                       mlt_frame topSource, mlt_frame bottomSource, bool callerWantsDevice, uint8_t **image, mlt_image_format *format, int *width,
+                       int *height, int writable)
 {
     TransitionJob &job = *plan.job;
     Runtime &runtime = Runtime::instance();
@@ -636,11 +711,7 @@ int runTransitionOnGpu(mlt_frame aFrame, mlt_get_image cpuGetImage, const Transi
     top.format = job.topFormat;
     top.width = job.topWidth;
     top.height = job.topHeight;
-    if (ctx.topOnGpu) {
-        mlt_properties_set_int(bProperties, kWantDevice, 1);
-    }
-    int error = mlt_frame_get_image(bFrame, &top.host, &top.format, &top.width, &top.height, 0);
-    mlt_properties_set_int(bProperties, kWantDevice, 0);
+    int error = fetchImage(bFrame, topSource, &top.host, &top.format, &top.width, &top.height, 0);
     top.device = takeDeviceImage(bProperties, top.host, top.width, top.height, top.format);
     FetchedImage bottom;
     if (error || !top.host) {
@@ -698,11 +769,7 @@ int runTransitionOnGpu(mlt_frame aFrame, mlt_get_image cpuGetImage, const Transi
     bottom.format = mlt_image_rgba;
     bottom.width = ctx.width;
     bottom.height = ctx.height;
-    if (ctx.bottomOnGpu) {
-        mlt_properties_set_int(aProperties, kWantDevice, 1);
-    }
-    error = mlt_frame_get_image(aFrame, &bottom.host, &bottom.format, &bottom.width, &bottom.height, job.bottomWritable);
-    mlt_properties_set_int(aProperties, kWantDevice, 0);
+    error = fetchImage(aFrame, bottomSource, &bottom.host, &bottom.format, &bottom.width, &bottom.height, job.bottomWritable);
     bottom.device = takeDeviceImage(aProperties, bottom.host, bottom.width, bottom.height, bottom.format);
     if (error || !bottom.host) {
         return error ? error : 1;
@@ -840,8 +907,10 @@ int bridgeTransitionGetImage(mlt_frame aFrame, uint8_t **image, mlt_image_format
     ctx.format = *format;
     ctx.width = *width;
     ctx.height = *height;
-    ctx.topOnGpu = belowTransitionIsBridge(bFrame, 0, transition, aFrame);
-    ctx.bottomOnGpu = belowTransitionIsBridge(aFrame, 2, transition, nullptr);
+    mlt_frame topSource = gpuSourceBelowTransition(bFrame, 0, transition, aFrame);
+    mlt_frame bottomSource = gpuSourceBelowTransition(aFrame, 2, transition, nullptr);
+    ctx.topOnGpu = topSource != nullptr;
+    ctx.bottomOnGpu = bottomSource != nullptr;
     ctx.callerOnGpu = callerWantsDevice;
     ctx.convertsOnGpu = !callerWantsDevice && deliversYuv422(aFrame, *format, *width, *height);
     TransitionPlan plan = descriptor.plan(ctx);
@@ -851,7 +920,7 @@ int bridgeTransitionGetImage(mlt_frame aFrame, uint8_t **image, mlt_image_format
         }
         return cpuGetImage(aFrame, image, format, width, height, writable);
     }
-    return runTransitionOnGpu(aFrame, cpuGetImage, descriptor, plan, ctx, callerWantsDevice, image, format, width, height, writable);
+    return runTransitionOnGpu(aFrame, cpuGetImage, descriptor, plan, ctx, topSource, bottomSource, callerWantsDevice, image, format, width, height, writable);
 }
 
 mlt_frame wrappedTransitionProcess(mlt_transition transition, mlt_frame aFrame, mlt_frame bFrame)

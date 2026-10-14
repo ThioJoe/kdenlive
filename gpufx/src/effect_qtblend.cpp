@@ -436,8 +436,9 @@ public:
 
     bool prepare(int bWidth, int bHeight, int bottomWidth, int bottomHeight) override
     {
-        // MLT 7.42 converts a bottom image of another size than requested
-        if (version >= 0x072a00 && (bottomWidth != requestWidth || bottomHeight != requestHeight)) {
+        // MLT 7.42 converts a bottom image of another size than requested.
+        // The 7.41 development versions do either.
+        if (version >= 0x072900 && (bottomWidth != requestWidth || bottomHeight != requestHeight)) {
             return false;
         }
         qt::Transform matrix = transform;
@@ -522,6 +523,7 @@ TransitionPlan planComposite(const TransitionContext &ctx)
         return TransitionPlan::cpu();
     }
     const bool v740 = version >= 0x072800;
+    const bool v741 = version >= 0x072900;
     const bool v742 = version >= 0x072a00;
     mlt_properties properties = ctx.properties;
     mlt_properties bProperties = MLT_FRAME_PROPERTIES(ctx.bFrame);
@@ -626,20 +628,37 @@ TransitionPlan planComposite(const TransitionContext &ctx)
         // we will process operations on top frame, so also process b_frame
         forceAlpha = true;
     }
-    if (v742 && (bWidth <= 0 || bHeight <= 0)) {
-        bWidth = normalizedWidth;
-        bHeight = normalizedHeight;
-        parAlreadyNormalized = true;
-    }
-    bWidth = std::max(1, bWidth);
-    bHeight = std::max(1, bHeight);
-    if (v740 && (!v742 || !parAlreadyNormalized)) {
-        // normalize_mlt_source_size()
-        if (bAr > 0.0 && consumerAr > 0.0 && bAr != consumerAr && bHeight > 0) {
-            bWidth = qRound(bWidth * bAr / consumerAr);
+    // MLT 7.42 avoids normalizing the pixel aspect ratio twice (parFlag).
+    // The 7.41 development versions may or may not do it: when that makes a
+    // difference, the CPU draws.
+    auto finishSize = [&](bool parFlag, int &w, int &h) {
+        bool normalized = parAlreadyNormalized;
+        if (parFlag && (w <= 0 || h <= 0)) {
+            w = normalizedWidth;
+            h = normalizedHeight;
+            normalized = true;
         }
-        bWidth = std::max(1, bWidth);
+        w = std::max(1, w);
+        h = std::max(1, h);
+        if (v740 && (!parFlag || !normalized)) {
+            // normalize_mlt_source_size()
+            if (bAr > 0.0 && consumerAr > 0.0 && bAr != consumerAr && h > 0) {
+                w = qRound(w * bAr / consumerAr);
+            }
+            w = std::max(1, w);
+        }
+    };
+    int flagWidth = bWidth;
+    int flagHeight = bHeight;
+    finishSize(true, flagWidth, flagHeight);
+    int noFlagWidth = bWidth;
+    int noFlagHeight = bHeight;
+    finishSize(false, noFlagWidth, noFlagHeight);
+    if (v741 && !v742 && (flagWidth != noFlagWidth || flagHeight != noFlagHeight)) {
+        return TransitionPlan::cpu();
     }
+    bWidth = v742 ? flagWidth : noFlagWidth;
+    bHeight = v742 ? flagHeight : noFlagHeight;
     if (v740 && rect.w > 0 && rect.h > 0 && bWidth > 0 && bHeight > 0) {
         // adjust_mlt_mipmap_size()
         double scaleTarget;
@@ -699,7 +718,7 @@ TransitionPlan planComposite(const TransitionContext &ctx)
     job->topFormat = forceAlpha ? mlt_image_rgba : format;
     job->topWidth = bWidth;
     job->topHeight = bHeight;
-    job->bottomWritable = v742 ? 1 : 0;
+    job->bottomWritable = v741 ? 1 : 0;
     job->version = version;
     job->rect = rect;
     job->consumerAr = consumerAr;

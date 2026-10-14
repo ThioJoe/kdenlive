@@ -81,10 +81,14 @@ its images is already there (a clip with accelerated effects, or the result
 of the transition below), or when the GPU can also convert the result to the
 format the caller asks for (see below). With two composited tracks or more,
 the whole stack is drawn on the GPU: every clip image is uploaded once and
-the final frame is downloaded once.
+the final frame is downloaded once. This includes Kdenlive's tracks, each of
+which MLT wraps in a tractor of its own: the result of a clip's accelerated
+effects is passed through the track's tractor on the GPU.
 
 The same cases as for Transform stay on the CPU (blend modes, 10-bit,
-rotation with *Distort*, scaling down with MLT 7.38).
+rotation with *Distort*, scaling down with MLT 7.38). MLT 7.41 only exists as
+development versions (Kdenlive 26.08 ships one), which do not all size the
+images the same way: when that makes a difference, the CPU composites.
 
 ### Image conversions
 
@@ -163,6 +167,10 @@ in `<prefix>/<libdir>/mlt-7`. Kdenlive loads the module from there if MLT did
 not, but `melt` (used for the final render) only loads modules from its own
 directory. Set `GPUFX_MLT_MODULE_DIR` to choose the location.
 
+On Windows the module must use the same C runtime as MLT, as they free each
+other's memory: Kdenlive's builds use UCRT, so a MinGW toolchain targeting
+UCRT (not the older `msvcrt.dll`).
+
 The CUDA kernels in `kernels/gpufx_kernels.cu` are shipped compiled to PTX in
 `kernels/gpufx_kernels.ptx`, so that no CUDA toolkit is needed. After changing
 the kernels, regenerate the PTX with nvcc:
@@ -191,6 +199,19 @@ comparisons on a real GPU, point the tests at the driver:
 GPUFX_CUDA_LIBRARY=libcuda.so.1 ./gpufx_test      # Linux
 set GPUFX_CUDA_LIBRARY=nvcuda.dll & gpufx_test.exe  # Windows
 ```
+
+On Windows, MLT looks for its modules next to the executable that uses it:
+set `MLT_REPOSITORY` to MLT's module folder (for Kdenlive's standalone build,
+`lib\mlt`), the tests pass it on to MLT.
+
+## Performance
+
+On an NVIDIA RTX 5090 with Kdenlive 26.08.1 for Windows (MLT 7.41, Qt 6.11,
+FFmpeg 8), rendering 4K 60 fps projects made of Lottie animations with
+Transform effects over an image background: H.264 4:2:0 renders ran 1.5 to
+2.2 times as fast, and renders to lossless RGB took about as long with 20 to
+30% less CPU time (the drawing of the animations and the encoding take most
+of the time there). Every frame was identical to the CPU render.
 
 ## How it works
 
