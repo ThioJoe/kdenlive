@@ -171,6 +171,17 @@ On Windows the module must use the same C runtime as MLT, as they free each
 other's memory: Kdenlive's builds use UCRT, so a MinGW toolchain targeting
 UCRT (not the older `msvcrt.dll`).
 
+The CUDA kernels in `kernels/gpufx_kernels.cu` are shipped compiled to PTX in
+`kernels/gpufx_kernels.ptx`, so that no CUDA toolkit is needed. After changing
+the kernels, regenerate the PTX with nvcc:
+
+```
+cmake --build <builddir> --target gpufx_update_ptx
+```
+
+or configure with `-DGPUFX_BUILD_PTX=ON` to compile the kernels during the
+build.
+
 ### Building the module alone
 
 `standalone/` builds the module without the rest of Kdenlive, for example to
@@ -191,17 +202,6 @@ Kdenlive's Windows standalone build: it compiles the module with MSYS2's UCRT
 toolchain against the `libmlt-7.dll` of the official build, runs the tests
 inside that build with the emulated GPU, and packages the module in a
 `kdenlive-<version>_standalone` folder that merges into an installed one.
-
-The CUDA kernels in `kernels/gpufx_kernels.cu` are shipped compiled to PTX in
-`kernels/gpufx_kernels.ptx`, so that no CUDA toolkit is needed. After changing
-the kernels, regenerate the PTX with nvcc:
-
-```
-cmake --build <builddir> --target gpufx_update_ptx
-```
-
-or configure with `-DGPUFX_BUILD_PTX=ON` to compile the kernels during the
-build.
 
 ## Tests
 
