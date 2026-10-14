@@ -16,13 +16,17 @@ installed in MLT's module directory.
 
 ## Accelerated effects
 
-| Kdenlive effect                     | MLT service       | Notes |
-|-------------------------------------|-------------------|-------|
-| Drop Shadow                         | `dropshadow`      | Matches the CPU filter (Qt's `QGraphicsDropShadowEffect`): same alpha, colors within one level, 8-bit only |
-| BoxBlur                             | `box_blur`        | Identical output, 8-bit only |
-| Box Blur                            | `boxblur`         | Identical output |
-| Intensity (Brightness), Fade in/out | `brightness`      | Lightweight, see below |
-| Lift/gamma/gain                     | `lift_gamma_gain` | Lightweight, see below |
+| Kdenlive effect                     | MLT service         | Notes |
+|-------------------------------------|---------------------|-------|
+| Drop Shadow                         | `dropshadow`        | Matches the CPU filter (Qt's `QGraphicsDropShadowEffect`): same alpha, colors within one level, 8-bit only |
+| BoxBlur                             | `box_blur`          | Identical output, 8-bit only |
+| Box Blur                            | `boxblur`           | Identical output |
+| Intensity (Brightness), Fade in/out | `brightness`        | Lightweight, see below |
+| Lift/gamma/gain                     | `lift_gamma_gain`   | Lightweight, see below |
+| Square Blur                         | `frei0r.squareblur` | Identical output |
+| Glow                                | `frei0r.glow`       | Identical output |
+| Soft Glow                           | `frei0r.softglow`   | Identical output |
+| Sharpen                             | `frei0r.sharpness`  | Identical output |
 
 Any mix of accelerated and CPU-only effects works: each accelerated effect is
 moved to the GPU for its own processing, and the others stay on the CPU.
@@ -38,8 +42,10 @@ example a fade applied next to a drop shadow).
 
 Frames in other formats than 8-bit RGBA (for example 16-bit `rgba64`
 processing), unusual parameter values, and any CUDA error fall back to the
-original CPU filter for that frame. An error that leaves the GPU in an
-unknown state turns GPU processing off for the rest of the session.
+original CPU filter for that frame. frei0r effects always work in 8-bit RGBA;
+they stay on the CPU when their MLT `threads` property splits the frame in
+slices. An error that leaves the GPU in an unknown state turns GPU processing
+off for the rest of the session.
 
 ## Requirements
 

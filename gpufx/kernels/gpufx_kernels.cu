@@ -359,3 +359,254 @@ GPUFX_KERNEL void gpufx_lut_rgba(const gpufx_u32 *__restrict__ src, gpufx_u32 *_
     const gpufx_u32 p = src[i];
     dst[i] = gpufx_pack(lut[p & 0xffu], lut[256 + ((p >> 8) & 0xffu)], lut[512 + ((p >> 16) & 0xffu)], lut[768 + (p >> 24)]);
 }
+
+/* ==========================================================================
+ * frei0r square blur (include/frei0r/blur.h), used by the "Square Blur",
+ * "Glow" and "Soft Glow" effects. The CPU version reads a summed area table:
+ * every channel, alpha included, is the sum of the pixels in
+ * [x - k, x + k] x [y - k, y + k] clipped to the image, divided by the number
+ * of pixels in the clipped rectangle (truncated). The sums are unsigned 32-bit
+ * like the table cells, so they wrap around the same way on huge images.
+ * Each thread handles a run of pixels, longer runs for larger kernels.
+ * ========================================================================== */
+
+GPUFX_DEV void gpufx_add_px_u(gpufx_u32 *acc, gpufx_u32 p)
+{
+    acc[0] += p & 0xffu;
+    acc[1] += (p >> 8) & 0xffu;
+    acc[2] += (p >> 16) & 0xffu;
+    acc[3] += p >> 24;
+}
+
+GPUFX_DEV void gpufx_sub_px_u(gpufx_u32 *acc, gpufx_u32 p)
+{
+    acc[0] -= p & 0xffu;
+    acc[1] -= (p >> 8) & 0xffu;
+    acc[2] -= (p >> 16) & 0xffu;
+    acc[3] -= p >> 24;
+}
+
+/* Horizontal sums, 4 x u32 per pixel. */
+GPUFX_KERNEL void gpufx_square_blur_h(const gpufx_u32 *__restrict__ src, gpufx_u32 *__restrict__ sums, int w, int h, int k, int run)
+{
+    const int x0 = GPUFX_GLOBAL_X * run;
+    const int y = GPUFX_GLOBAL_Y;
+    if (x0 >= w || y >= h) {
+        return;
+    }
+    const gpufx_u32 *row = src + size_t(y) * size_t(w);
+    gpufx_u32 *out = sums + 4 * size_t(y) * size_t(w);
+    const int last = w - 1;
+    gpufx_u32 acc[4] = {0, 0, 0, 0};
+    const int hi = gpufx_min(x0 + k, last);
+    for (int i = gpufx_max(x0 - k, 0); i <= hi; ++i) {
+        gpufx_add_px_u(acc, row[i]);
+    }
+    const int x1 = gpufx_min(x0 + run, w);
+    for (int x = x0; x < x1; ++x) {
+        gpufx_u32 *o = out + 4 * size_t(x);
+        o[0] = acc[0];
+        o[1] = acc[1];
+        o[2] = acc[2];
+        o[3] = acc[3];
+        if (x + 1 + k <= last) {
+            gpufx_add_px_u(acc, row[x + 1 + k]);
+        }
+        if (x - k >= 0) {
+            gpufx_sub_px_u(acc, row[x - k]);
+        }
+    }
+}
+
+// frei0r's INT_MULT(): a * b / 255 rounded
+GPUFX_DEV gpufx_u32 gpufx_int_mult(gpufx_u32 a, gpufx_u32 b)
+{
+    const gpufx_u32 t = a * b + 0x80u;
+    return ((t >> 8) + t) >> 8;
+}
+
+#define GPUFX_SQUARE_BLUR_PLAIN 0
+#define GPUFX_SQUARE_BLUR_GLOW 1
+#define GPUFX_SQUARE_BLUR_SOFTGLOW_SCREEN 2
+#define GPUFX_SQUARE_BLUR_SOFTGLOW_OVERLAY 3
+#define GPUFX_SQUARE_BLUR_SOFTGLOW_ADD 4
+
+/* What the effects do with the blurred pixel b and the input pixel s. */
+GPUFX_DEV gpufx_u32 gpufx_square_blur_output(const gpufx_u32 *b, gpufx_u32 s, int mode)
+{
+    gpufx_u32 c[4];
+    for (int i = 0; i < 4; ++i) {
+        const gpufx_u32 sc = (s >> (8 * i)) & 0xffu;
+        switch (mode) {
+        case GPUFX_SQUARE_BLUR_GLOW: // glow.c, alpha included
+            c[i] = 255u - ((255u - sc) * (255u - b[i])) / 255u;
+            break;
+        case GPUFX_SQUARE_BLUR_SOFTGLOW_SCREEN: // softglow.c screen()
+            c[i] = 255u - gpufx_int_mult(255u - b[i], 255u - sc);
+            break;
+        case GPUFX_SQUARE_BLUR_SOFTGLOW_OVERLAY: // softglow.c overlay()
+            c[i] = gpufx_int_mult(b[i], b[i] + gpufx_int_mult(2u * sc, 255u - b[i]));
+            break;
+        case GPUFX_SQUARE_BLUR_SOFTGLOW_ADD: // softglow.c add()
+            c[i] = b[i] + sc > 255u ? 255u : b[i] + sc;
+            break;
+        default:
+            c[i] = b[i];
+            break;
+        }
+        c[i] &= 0xffu;
+    }
+    if (mode >= GPUFX_SQUARE_BLUR_SOFTGLOW_SCREEN) {
+        // The soft glow blends keep the smaller alpha
+        const gpufx_u32 sa = s >> 24;
+        c[3] = b[3] < sa ? b[3] : sa;
+    }
+    return gpufx_pack(c[0], c[1], c[2], c[3]);
+}
+
+/* Vertical sums of the horizontal sums, average, then the effect's blend with
+ * the input image src (see gpufx_square_blur_output). */
+GPUFX_KERNEL void gpufx_square_blur_v(const gpufx_u32 *__restrict__ sums, const gpufx_u32 *__restrict__ src, gpufx_u32 *__restrict__ dst, int w, int h, int k,
+                                      int run, int mode)
+{
+    const int x = GPUFX_GLOBAL_X;
+    const int y0 = GPUFX_GLOBAL_Y * run;
+    if (x >= w || y0 >= h) {
+        return;
+    }
+    const size_t stride = 4 * size_t(w);
+    const gpufx_u32 *col = sums + 4 * size_t(x);
+    const int last = h - 1;
+    gpufx_u32 acc[4] = {0, 0, 0, 0};
+    const int hi = gpufx_min(y0 + k, last);
+    for (int j = gpufx_max(y0 - k, 0); j <= hi; ++j) {
+        const gpufx_u32 *s = col + size_t(j) * stride;
+        acc[0] += s[0];
+        acc[1] += s[1];
+        acc[2] += s[2];
+        acc[3] += s[3];
+    }
+    const gpufx_u32 columns = gpufx_u32(gpufx_min(x + k, w - 1) - gpufx_max(x - k, 0) + 1);
+    const int y1 = gpufx_min(y0 + run, h);
+    for (int y = y0; y < y1; ++y) {
+        const gpufx_u32 area = columns * gpufx_u32(gpufx_min(y + k, last) - gpufx_max(y - k, 0) + 1);
+        gpufx_u32 b[4];
+        for (int i = 0; i < 4; ++i) {
+            b[i] = (acc[i] / area) & 0xffu;
+        }
+        const size_t index = size_t(y) * size_t(w) + size_t(x);
+        dst[index] = gpufx_square_blur_output(b, src[index], mode);
+        if (y + 1 + k <= last) {
+            const gpufx_u32 *s = col + size_t(y + 1 + k) * stride;
+            acc[0] += s[0];
+            acc[1] += s[1];
+            acc[2] += s[2];
+            acc[3] += s[3];
+        }
+        if (y - k >= 0) {
+            const gpufx_u32 *s = col + size_t(y - k) * stride;
+            acc[0] -= s[0];
+            acc[1] -= s[1];
+            acc[2] -= s[2];
+            acc[3] -= s[3];
+        }
+    }
+}
+
+/* First step of frei0r's "Soft Glow": the lightness of every pixel (GIMP's
+ * (max + min) / 2, rounded) through the sigmoidal transfer, which is
+ * precomputed on the host in curve. Alpha is kept. */
+GPUFX_KERNEL void gpufx_softglow_highlights(const gpufx_u32 *__restrict__ src, gpufx_u32 *__restrict__ dst, int n, const gpufx_u8 *__restrict__ curve)
+{
+    const int i = GPUFX_GLOBAL_X;
+    if (i >= n) {
+        return;
+    }
+    const gpufx_u32 p = src[i];
+    const int r = int(p & 0xffu);
+    const int g = int((p >> 8) & 0xffu);
+    const int b = int((p >> 16) & 0xffu);
+    const int high = gpufx_max(r, gpufx_max(g, b));
+    const int low = gpufx_min(r, gpufx_min(g, b));
+    const gpufx_u32 v = curve[(high + low + 1) >> 1];
+    dst[i] = v | (v << 8) | (v << 16) | (p & 0xff000000u);
+}
+
+/* ==========================================================================
+ * frei0r "Sharpness" (Kdenlive's "Sharpen"), MPlayer's unsharp mask. The
+ * blur is a cascade of [1 1] filters, which amounts to binomial weights over
+ * 2 * steps + 1 pixels with edge pixels repeated, here in two separable
+ * passes with the same exact integer sums. Red, green and blue are sharpened,
+ * alpha is kept.
+ * ========================================================================== */
+
+#define GPUFX_UNSHARP_MAX_STEPS 6
+
+GPUFX_DEV void gpufx_binomial(int *weights, int n)
+{
+    weights[0] = 1;
+    for (int i = 0; i < n; ++i) {
+        weights[i + 1] = weights[i] * (n - i) / (i + 1);
+    }
+}
+
+/* Horizontal weighted sums of red, green and blue, 4 x u32 per pixel. */
+GPUFX_KERNEL void gpufx_unsharp_h(const gpufx_u32 *__restrict__ src, gpufx_u32 *__restrict__ sums, int w, int h, int steps)
+{
+    const int x = GPUFX_GLOBAL_X;
+    const int y = GPUFX_GLOBAL_Y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    int weights[2 * GPUFX_UNSHARP_MAX_STEPS + 1];
+    gpufx_binomial(weights, 2 * steps);
+    const gpufx_u32 *row = src + size_t(y) * size_t(w);
+    gpufx_u32 acc[3] = {0, 0, 0};
+    for (int d = -steps; d <= steps; ++d) {
+        const gpufx_u32 p = row[gpufx_clamp(x + d, 0, w - 1)];
+        const gpufx_u32 weight = gpufx_u32(weights[d + steps]);
+        acc[0] += weight * (p & 0xffu);
+        acc[1] += weight * ((p >> 8) & 0xffu);
+        acc[2] += weight * ((p >> 16) & 0xffu);
+    }
+    gpufx_u32 *o = sums + 4 * (size_t(y) * size_t(w) + size_t(x));
+    o[0] = acc[0];
+    o[1] = acc[1];
+    o[2] = acc[2];
+    o[3] = 0;
+}
+
+/* Vertical weighted sums, then unsharp(): the scaled difference between the
+ * pixel and its blurred value is added to the pixel (amount in 16.16). */
+GPUFX_KERNEL void gpufx_unsharp_v(const gpufx_u32 *__restrict__ sums, const gpufx_u32 *__restrict__ src, gpufx_u32 *__restrict__ dst, int w, int h, int steps,
+                                  int amount)
+{
+    const int x = GPUFX_GLOBAL_X;
+    const int y = GPUFX_GLOBAL_Y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    int weights[2 * GPUFX_UNSHARP_MAX_STEPS + 1];
+    gpufx_binomial(weights, 2 * steps);
+    const gpufx_u32 *col = sums + 4 * size_t(x);
+    gpufx_u32 acc[3] = {0, 0, 0};
+    for (int d = -steps; d <= steps; ++d) {
+        const gpufx_u32 *s = col + 4 * size_t(gpufx_clamp(y + d, 0, h - 1)) * size_t(w);
+        const gpufx_u32 weight = gpufx_u32(weights[d + steps]);
+        acc[0] += weight * s[0];
+        acc[1] += weight * s[1];
+        acc[2] += weight * s[2];
+    }
+    const int scalebits = 4 * steps;
+    const gpufx_u32 halfscale = 1u << (scalebits - 1);
+    const size_t index = size_t(y) * size_t(w) + size_t(x);
+    const gpufx_u32 p = src[index];
+    gpufx_u32 c[3];
+    for (int i = 0; i < 3; ++i) {
+        const int value = int((p >> (8 * i)) & 0xffu);
+        const int blurred = int((acc[i] + halfscale) >> scalebits);
+        const int res = value + (((value - blurred) * amount) >> 16);
+        c[i] = gpufx_u32(gpufx_clamp(res, 0, 255));
+    }
+    dst[index] = gpufx_pack(c[0], c[1], c[2], p >> 24);
+}

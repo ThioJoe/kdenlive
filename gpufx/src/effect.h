@@ -90,5 +90,9 @@ const EffectDescriptor &boxBlurEffect();
 const EffectDescriptor &rectBlurEffect();
 const EffectDescriptor &brightnessEffect();
 const EffectDescriptor &liftGammaGainEffect();
+const EffectDescriptor &frei0rSquareBlurEffect();
+const EffectDescriptor &frei0rGlowEffect();
+const EffectDescriptor &frei0rSoftGlowEffect();
+const EffectDescriptor &frei0rSharpnessEffect();
 
 } // namespace gpufx

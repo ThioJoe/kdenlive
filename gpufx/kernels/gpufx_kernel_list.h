@@ -21,4 +21,9 @@
     X(gpufx_box_blur_v)                                                                                                                                        \
     X(gpufx_rect_blur_h)                                                                                                                                       \
     X(gpufx_rect_blur_v)                                                                                                                                       \
-    X(gpufx_lut_rgba)
+    X(gpufx_lut_rgba)                                                                                                                                          \
+    X(gpufx_square_blur_h)                                                                                                                                     \
+    X(gpufx_square_blur_v)                                                                                                                                     \
+    X(gpufx_softglow_highlights)                                                                                                                               \
+    X(gpufx_unsharp_h)                                                                                                                                         \
+    X(gpufx_unsharp_v)

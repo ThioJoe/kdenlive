@@ -415,6 +415,49 @@ void testColor(mlt_profile profile)
                input, true);
 }
 
+void testFrei0r(mlt_profile profile)
+{
+    const Image input = makeImage(160, 90, 1);
+    const Image portrait = makeImage(53, 97, 2);
+    // Square Blur: the kernel size is relative to the largest side
+    for (const char *kernel : {"0", "0.004", "0.05", "0.3", "1", "3"}) {
+        expectSame(profile, {{"frei0r.squareblur", {{"Kernel size", kernel}}}}, input, true);
+    }
+    expectSame(profile, {{"frei0r.squareblur", {{"0", "0.2"}}}}, portrait, true);
+    for (const char *blur : {"0", "0.01", "0.2", "1", "10"}) {
+        expectSame(profile, {{"frei0r.glow", {{"Blur", blur}}}}, input, true);
+    }
+    expectSame(profile, {{"frei0r.glow", {{"Blur", "2"}}}}, portrait, true);
+    for (const char *blend : {"0", "0.5", "1"}) {
+        for (const char *blur : {"0", "0.1", "0.5"}) {
+            expectSame(profile, {{"frei0r.softglow", {{"blurblend", blend}, {"blur", blur}, {"brightness", "0.6"}, {"sharpness", "0.7"}}}}, input, true);
+        }
+    }
+    // Plugin defaults
+    expectSame(profile, {{"frei0r.softglow", {}}}, portrait, true);
+    for (const char *amount : {"0", "0.3", "0.5", "1"}) {
+        for (const char *size : {"0", "0.3", "0.5", "1"}) {
+            expectSame(profile, {{"frei0r.sharpness", {{"Amount", amount}, {"Size", size}}}}, input, true);
+        }
+    }
+    expectSame(profile, {{"frei0r.sharpness", {{"0", "0.9"}, {"1", "0.2"}}}}, makeImage(31, 7, 3), true);
+    // Animated parameters, mixed with other effects
+    expectSame(profile,
+               {{"frei0r.glow", {{"Blur", "0=0.1;10=0.9"}, {"out", "10"}}},
+                {"dropshadow", {{"radius", "4"}}},
+                {"frei0r.sharpness", {{"Amount", "0.7"}, {"Size", "0=0;10=1"}, {"out", "10"}}},
+                {"frei0r.softglow", {{"blur", "0.05"}}}},
+               input, false, 5);
+    if (g_mock.active() && hasFilter("frei0r.squareblur")) {
+        // MLT slices the frame when "threads" is set: left to the CPU. The
+        // slices share one plugin instance, so the CPU result is not even
+        // repeatable for this plugin, nothing to compare.
+        g_mock.reset();
+        render(profile, {{"frei0r.squareblur", {{"Kernel size", "0.1"}, {"threads", "0"}}}}, input, false);
+        check(mlt_slices_count_normal() == 1 || g_mock.stats().launches == 0, "a sliced frei0r filter ran on the GPU");
+    }
+}
+
 void testChains(mlt_profile profile)
 {
     const Image input = makeImage(120, 80, 2);
@@ -628,6 +671,7 @@ int main(int argc, char **argv)
     testBoxBlur(profile);
     testRectBlur(profile);
     testColor(profile);
+    testFrei0r(profile);
     testChains(profile);
     testProducer(profile);
     testGlobalSwitch(profile);
