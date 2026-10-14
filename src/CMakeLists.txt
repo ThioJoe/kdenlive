@@ -104,7 +104,7 @@ endif()
 file(GLOB kdenlive_UIS "ui/*.ui")
 ki18n_wrap_ui(kdenlive_UIS ${kdenlive_UIS})
 
-add_library(kdenliveLib STATIC ${kdenlive_SRCS} ${kdenlive_UIS} definitions.h lib/localeHandling.cpp lib/localeHandling.h)
+add_library(kdenliveLib STATIC ${kdenlive_SRCS} ${kdenlive_UIS} definitions.h lib/localeHandling.cpp lib/localeHandling.h lib/gpuEffectsModule.cpp lib/gpuEffectsModule.h)
 
 # Precompile some stdlib/Qt headers for faster build time
 target_precompile_headers(kdenliveLib PRIVATE

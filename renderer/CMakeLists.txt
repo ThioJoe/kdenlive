@@ -10,6 +10,7 @@ set(kdenlive_render_SRCS
   kdenlive_render.cpp
   renderjob.cpp
   ../src/lib/localeHandling.cpp
+  ../src/lib/gpuEffectsModule.cpp
 )
 
 ecm_qt_declare_logging_category(kdenlive_render_SRCS
@@ -22,6 +23,8 @@ ecm_qt_declare_logging_category(kdenlive_render_SRCS
 
 add_executable(kdenlive_render ${kdenlive_render_SRCS})
 ecm_mark_nongui_executable(kdenlive_render)
+# config-kdenlive.h
+target_include_directories(kdenlive_render PRIVATE ${CMAKE_BINARY_DIR})
 
 target_link_libraries(kdenlive_render
     Qt${QT_MAJOR_VERSION}::Core

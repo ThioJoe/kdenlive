@@ -5,7 +5,6 @@ SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 */
 
 #include "mltconnection.h"
-#include "config-kdenlive.h"
 #include "core.h"
 #include "kdenlivesettings.h"
 #include "mainwindow.h"
@@ -16,11 +15,11 @@ SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
-#include <QLibrary>
 #include <QTextStream>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <clocale>
+#include <lib/gpuEffectsModule.h>
 #include <lib/localeHandling.h>
 #include <mlt++/MltFactory.h>
 #include <mlt++/MltFilter.h>
@@ -71,42 +70,6 @@ static QString getShortPath(const QString &longPath)
     return longPath;
 }
 #endif
-
-/** @brief Registers the gpufx MLT module (GPU effects) if MLT did not load it.
- *  MLT only loads modules from its own directory, which is not where the module
- *  ends up when Kdenlive is installed to another prefix than MLT. */
-static void loadGpuEffectsModule()
-{
-    mlt_repository repository = mlt_factory_repository();
-    const QString moduleDir = QStringLiteral(KDENLIVE_GPUFX_MODULE_DIR);
-    if (!repository || moduleDir.isEmpty() || mlt_properties_get_data(mlt_repository_filters(repository), "gpufx", nullptr)) {
-        return;
-    }
-    QStringList dirs;
-    if (QDir::isAbsolutePath(moduleDir)) {
-        dirs << moduleDir;
-    } else {
-        dirs << QDir::cleanPath(qApp->applicationDirPath() + QStringLiteral("/../") + moduleDir);
-        dirs << QDir::cleanPath(QStringLiteral(KDENLIVE_INSTALL_PREFIX) + QLatin1Char('/') + moduleDir);
-    }
-    const QStringList names = {QStringLiteral("libmltgpufx.so"), QStringLiteral("libmltgpufx.dll"), QStringLiteral("mltgpufx.dll")};
-    for (const QString &dir : std::as_const(dirs)) {
-        for (const QString &name : names) {
-            const QString path = QDir(dir).absoluteFilePath(name);
-            if (!QFile::exists(path)) {
-                continue;
-            }
-            QLibrary module(path);
-            auto registerModule = reinterpret_cast<void (*)(mlt_repository)>(module.resolve("mlt_register"));
-            if (registerModule) {
-                registerModule(repository);
-                qDebug() << "Loaded the GPU effects module" << path;
-                return;
-            }
-            qWarning() << "Cannot load the GPU effects module" << path << module.errorString();
-        }
-    }
-}
 
 void MltConnection::applyGpuEffectsSetting()
 {

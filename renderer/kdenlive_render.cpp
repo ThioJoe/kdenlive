@@ -4,6 +4,7 @@
     SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 */
 
+#include "../src/lib/gpuEffectsModule.h"
 #include "../src/lib/localeHandling.h"
 #include "kdenlive_renderer_debug.h"
 #include "mlt++/Mlt.h"
@@ -97,6 +98,7 @@ int main(int argc, char **argv)
         // After initialising the MLT factory, set the locale back from user default to C
         // to ensure numbers are always serialised with . as decimal point.
         Mlt::Factory::init(repoPath.isEmpty() ? NULL : repoPath.toUtf8().constData());
+        loadGpuEffectsModule();
         LocaleHandling::resetAllLocale();
 
         // mode
