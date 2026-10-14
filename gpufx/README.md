@@ -171,6 +171,27 @@ On Windows the module must use the same C runtime as MLT, as they free each
 other's memory: Kdenlive's builds use UCRT, so a MinGW toolchain targeting
 UCRT (not the older `msvcrt.dll`).
 
+### Building the module alone
+
+`standalone/` builds the module without the rest of Kdenlive, for example to
+add it to an installed Kdenlive:
+
+```
+cmake -S gpufx/standalone -B build
+cmake --build build
+cmake --install build --prefix <Kdenlive's folder>
+```
+
+It finds MLT through its CMake package. For an MLT without development files,
+such as the one in Kdenlive's Windows standalone build, pass MLT's headers and
+library: `-DMLT_INCLUDE_DIR=<MLT source>/src -DMLT_LIBRARY=<Kdenlive>/bin/libmlt-7.dll`.
+
+The GitHub workflow `.github/workflows/gpufx-windows.yml` does this for
+Kdenlive's Windows standalone build: it compiles the module with MSYS2's UCRT
+toolchain against the `libmlt-7.dll` of the official build, runs the tests
+inside that build with the emulated GPU, and uploads the module in a
+`kdenlive-<version>_standalone` folder that merges into an installed one.
+
 The CUDA kernels in `kernels/gpufx_kernels.cu` are shipped compiled to PTX in
 `kernels/gpufx_kernels.ptx`, so that no CUDA toolkit is needed. After changing
 the kernels, regenerate the PTX with nvcc:
