@@ -6,9 +6,9 @@
 # out like the standalone's folder: merging the package's
 # kdenlive-<version>_standalone folder into an installed one adds the module.
 #
-# This repository only allows its own actions, so the workflow uses none:
-# the source is fetched with git, and the compiler comes from the MSYS2
-# installation of GitHub's Windows runners.
+# This repository only allows its own actions and actions/upload-artifact,
+# so the workflow uses no other: the source is fetched with git, and the
+# compiler comes from the MSYS2 installation of GitHub's Windows runners.
 
 name: GPU effects module for Kdenlive on Windows
 
@@ -176,18 +176,24 @@ jobs:
           EOF
           find dist -type f
 
-      - name: Zip
-        shell: pwsh
-        run: |
-          $zip = "gpufx-kdenlive-$($env:KDENLIVE_VERSION)-windows.zip"
-          Compress-Archive -Path dist\* -DestinationPath $zip
-          Get-Item $zip | ForEach-Object { "{0}: {1:N0} bytes" -f $_.Name, $_.Length }
+      # Downloaded as a zip of the dist folder: the README and the
+      # kdenlive-<version>_standalone folder
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpufx-kdenlive-${{ env.KDENLIVE_VERSION }}-windows
+          path: dist/
+          if-no-files-found: error
 
       - name: Summary
         shell: bash
         run: |
           {
             echo "### GPU effects module for Kdenlive ${KDENLIVE_VERSION} on Windows"
+            echo
+            echo "Download **gpufx-kdenlive-${KDENLIVE_VERSION}-windows** under Artifacts below and unzip it."
+            echo "Drag its \`kdenlive-${KDENLIVE_VERSION}_standalone\` folder into the folder that contains your Kdenlive folder and let Windows merge them:"
+            echo "it adds \`lib\\mlt\\libmltgpufx.dll\`."
             echo
             echo "Tests run inside Kdenlive ${KDENLIVE_VERSION}'s own build, with an emulated GPU:"
             echo
