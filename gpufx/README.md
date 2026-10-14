@@ -200,7 +200,7 @@ library: `-DMLT_INCLUDE_DIR=<MLT source>/src -DMLT_LIBRARY=<Kdenlive>/bin/libmlt
 The GitHub workflow `.github/workflows/gpufx-windows.yml` does this for
 Kdenlive's Windows standalone build: it compiles the module with MSYS2's UCRT
 toolchain against the `libmlt-7.dll` of the official build, runs the tests
-inside that build with the emulated GPU, and packages the module in a
+inside that build with the emulated GPU, and uploads the module in a
 `kdenlive-<version>_standalone` folder that merges into an installed one.
 
 ## Tests
