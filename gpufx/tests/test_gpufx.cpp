@@ -1090,8 +1090,11 @@ void testYuvOutput(mlt_profile profile)
         {160, 90, 2, 601, {}, true},
         {96, 54, 3, 2020, {}, true},
         {96, 54, 0, 240, {}, true},
-        {160, 90, 4, 709, {{"consumer.color_range", "full"}}, true},
-        {160, 90, 1, 601, {{"consumer.color_range", "pc"}}, true},
+        // Full range output stays with the CPU conversion, which differs
+        // between FFmpeg versions
+        {160, 90, 4, 709, {{"consumer.color_range", "full"}}, false},
+        {160, 90, 1, 601, {{"consumer.color_range", "pc"}}, false},
+        {160, 90, 2, 709, {{"consumer.color_range", "mpeg"}}, true},
         // Odd widths stay with the CPU conversion
         {97, 54, 2, 709, {}, false},
     };

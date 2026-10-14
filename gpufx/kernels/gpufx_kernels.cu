@@ -1055,8 +1055,9 @@ GPUFX_DEV int gpufx_sws_rgba_chroma(gpufx_u32 px0, gpufx_u32 px1, int cr, int cg
 
 /* RGBA to YUYV 4:2:2 with SWS_BICUBIC and SWS_ACCURATE_RND: the 15-bit
  * values of gpufx_sws_rgba_luma() and gpufx_sws_rgba_chroma(), converted to
- * full range by lumRangeToJpeg_c() and chrRangeToJpeg_c() when fullRange is
- * set, written by yuv2422_1_c_template(). When alpha is not null the alpha
+ * full range by lumRangeToJpeg_c() and chrRangeToJpeg_c() of FFmpeg 7.1 and
+ * older when fullRange is set (FFmpeg 8.0 rounds that step differently),
+ * written by yuv2422_1_c_template(). When alpha is not null the alpha
  * channel is also copied there, one byte per pixel, as MLT's avcolour_space
  * does. One thread per pair of pixels, the width must be even. */
 GPUFX_KERNEL void gpufx_rgba_to_yuyv422(const gpufx_u32 *__restrict__ src, gpufx_u8 *__restrict__ dst, gpufx_u8 *__restrict__ alpha, int w, int h,

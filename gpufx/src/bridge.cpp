@@ -247,6 +247,12 @@ bool deliversYuv422(mlt_frame frame, mlt_image_format requested, int width, int 
     if (mlt_properties_get_int(properties, "convert_image_width") || mlt_properties_get_int(properties, "convert_image_height")) {
         return false;
     }
+    // FFmpeg 8.0 changed the rounding of libswscale's conversion to full
+    // range YUV, and which FFmpeg MLT uses is not known here: those stay on
+    // the CPU (limited range is the default)
+    if (mlt_image_full_range(mlt_properties_get(properties, "consumer.color_range"))) {
+        return false;
+    }
     void *converter = frameConverter(frame);
     return converter && converter == avcolourConverter();
 }
@@ -260,7 +266,7 @@ CUresult deliverYuv422(GpuScope &scope, CUdeviceptr rgba, mlt_frame frame, int w
     mlt_producer producer = mlt_frame_get_original_producer(frame);
     mlt_profile profile = producer ? mlt_service_profile(MLT_PRODUCER_SERVICE(producer)) : nullptr;
     const int colorspace = profile ? profile->colorspace : mlt_colorspace_bt601;
-    const int fullRange = mlt_image_full_range(mlt_properties_get(properties, "consumer.color_range"));
+    const int fullRange = 0; // see deliversYuv422()
     const int size = width * height * 2;
     const int alphaSize = width * height;
     auto *yuv = static_cast<uint8_t *>(mlt_pool_alloc(size));

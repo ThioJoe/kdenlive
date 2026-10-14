@@ -43,7 +43,8 @@ CUresult convertYuv420ToRgba(GpuScope &scope, const Yuv420Image &image, DeviceBu
  *  as MLT's avcolour_space does (sws_scale() with SWS_BICUBIC |
  *  SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT) and downloads it, along with the
  *  alpha channel when alpha is not null. colorspace is the mlt_colorspace of
- *  the output. The width must be even. Synchronizes the stream. */
+ *  the output. Full range output follows FFmpeg 7.1 and older. The width must
+ *  be even. Synchronizes the stream. */
 CUresult convertRgbaToYuv422(GpuScope &scope, CUdeviceptr rgba, int width, int height, int colorspace, bool fullRange, uint8_t *yuv422, uint8_t *alpha);
 
 } // namespace gpufx

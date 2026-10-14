@@ -113,9 +113,12 @@ back to YUV.
 Both conversions reproduce libswscale with the flags MLT uses: the
 coefficients, chroma sampling positions and rounding are ported in
 `src/sws_port.cpp`, and the output is identical for every colorspace MLT
-handles (BT.601, BT.709, BT.2020, SMPTE 240M), limited and full range, and
-MLT's field by field conversion of interlaced video. These parts of
-libswscale are the same in FFmpeg 6.1, 7.1 and 8.0.
+handles (BT.601, BT.709, BT.2020, SMPTE 240M), limited and full range video,
+and MLT's field by field conversion of interlaced video. This was checked
+against libswscale of FFmpeg 6.1, 7.1 and 8.0, with and without its SIMD
+code. One exception: FFmpeg 8.0 rounds the conversion to full range YUV
+differently from older versions, so a full range output (a consumer with
+`color_range=full`, not Kdenlive's default) keeps the CPU conversion.
 
 ## Requirements
 
