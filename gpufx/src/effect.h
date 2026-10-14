@@ -109,9 +109,93 @@ struct EffectDescriptor
     EffectPlan (*plan)(const EffectContext &ctx);
 };
 
+/** What a transition is asked to do for one frame, read before any image is
+ *  fetched. The transition draws the top frame (b) onto the bottom frame (a). */
+struct TransitionContext
+{
+    mlt_transition transition = nullptr;
+    mlt_frame aFrame = nullptr;
+    mlt_frame bFrame = nullptr;
+    mlt_properties properties = nullptr; // the transition's properties
+    mlt_position position = 0;
+    mlt_position length = 0;
+    // The format and size requested by the caller of get_image
+    mlt_image_format format = mlt_image_none;
+    int width = 0;
+    int height = 0;
+    // Whether the top and bottom images, or the caller, are on the GPU anyway
+    bool topOnGpu = false;
+    bool bottomOnGpu = false;
+    bool callerOnGpu = false;
+};
+
+/** The GPU work of a transition for one frame. */
+class TransitionJob
+{
+public:
+    virtual ~TransitionJob() = default;
+
+    /** The top image to request */
+    mlt_image_format topFormat = mlt_image_rgba;
+    int topWidth = 0;
+    int topHeight = 0;
+    /** The top image is returned unchanged, without the bottom one, when it
+     *  turns out to have no transparency (MLT's qtblend does that). topAlpha
+     *  tells if the top image has an alpha channel before it is fetched. */
+    bool passOpaqueTop = false;
+    bool topAlpha = false;
+    /** Called right before the top image is fetched, for the frame changes
+     *  the CPU transition makes at that point. */
+    virtual void beforeFetch(mlt_frame aFrame, mlt_frame bFrame)
+    {
+        (void)aFrame;
+        (void)bFrame;
+    }
+    /** The frame properties the CPU transition copies from the top frame
+     *  when it returns the top image unchanged. */
+    virtual void passFrameProperties(mlt_frame aFrame, mlt_frame bFrame) = 0;
+    /** The CPU transition's way of returning the top image unchanged, for a
+     *  top image in host memory. */
+    virtual int passThrough(mlt_frame aFrame, mlt_frame bFrame, uint8_t *top, mlt_image_format topFormat, int topWidth, int topHeight, uint8_t **image,
+                            mlt_image_format *format, int *width, int *height) = 0;
+    /** The bottom image is fetched with this writable flag. */
+    int bottomWritable = 0;
+    /** Called once both images are fetched (the top one in RGBA). Returning
+     *  false leaves the frame to the CPU transition. */
+    virtual bool prepare(int topWidth, int topHeight, int bottomWidth, int bottomHeight) = 0;
+    /** Draws top onto bottom into out (bottom size). */
+    virtual CUresult run(GpuScope &scope, CUdeviceptr top, CUdeviceptr bottom, CUdeviceptr out) = 0;
+};
+
+struct TransitionPlan
+{
+    Decision decision = Decision::Cpu;
+    std::unique_ptr<TransitionJob> job;
+
+    static TransitionPlan cpu() { return {}; }
+    static TransitionPlan gpu(std::unique_ptr<TransitionJob> job)
+    {
+        TransitionPlan plan;
+        plan.decision = Decision::Gpu;
+        plan.job = std::move(job);
+        return plan;
+    }
+};
+
+struct TransitionDescriptor
+{
+    /** MLT service name of the CPU transition that gets accelerated */
+    const char *service;
+    /** Reads the parameters for this frame. Must not fetch images nor change
+     *  the frames (see TransitionJob::beforeFetch()). */
+    TransitionPlan (*plan)(const TransitionContext &ctx);
+};
+
 /** All the effects with a GPU implementation */
 const std::vector<const EffectDescriptor *> &effectRegistry();
 const EffectDescriptor *findEffect(const char *service);
+const std::vector<const TransitionDescriptor *> &transitionRegistry();
+const TransitionDescriptor *findTransition(const char *service);
 
 // Implemented in the effect_*.cpp files
 const EffectDescriptor &dropShadowEffect();
@@ -124,5 +208,6 @@ const EffectDescriptor &frei0rGlowEffect();
 const EffectDescriptor &frei0rSoftGlowEffect();
 const EffectDescriptor &frei0rSharpnessEffect();
 const EffectDescriptor &transformEffect();
+const TransitionDescriptor &compositeTransition();
 
 } // namespace gpufx

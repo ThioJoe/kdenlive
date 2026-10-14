@@ -113,6 +113,34 @@ void onFilterCreated(mlt_properties, void *, mlt_event_data eventData)
     }
 }
 
+void onTransitionCreated(mlt_properties, void *, mlt_event_data eventData)
+{
+    auto *data = static_cast<mlt_factory_event_data *>(mlt_event_data_to_object(eventData));
+    if (!data || !data->name || !data->service) {
+        return;
+    }
+    mlt_transition transition = *static_cast<mlt_transition *>(data->service);
+    const TransitionDescriptor *descriptor = transition ? findTransition(data->name) : nullptr;
+    if (descriptor) {
+        wrapTransition(transition, *descriptor);
+    }
+}
+
+std::string transitionList()
+{
+    std::string list;
+    for (const TransitionDescriptor *transition : transitionRegistry()) {
+        if (!serviceEnabled(transition->service)) {
+            continue;
+        }
+        if (!list.empty()) {
+            list += ',';
+        }
+        list += transition->service;
+    }
+    return list;
+}
+
 std::string effectList()
 {
     std::string list;
@@ -155,6 +183,7 @@ void *statusServiceInit(mlt_profile, mlt_service_type, const char *, const void 
     mlt_properties_set(properties, "cuda_driver", device.driverVersion > 0 ? text : "");
     mlt_properties_set_int(properties, "memory_mb", int(device.totalMemory >> 20));
     mlt_properties_set(properties, "effects", effectList().c_str());
+    mlt_properties_set(properties, "transitions", transitionList().c_str());
     mlt_properties_set_int64(properties, "gpu_frames", int64_t(runtime.gpuFrames()));
     mlt_properties_set_int64(properties, "cpu_frames", int64_t(runtime.cpuFrames()));
     return filter;
@@ -227,14 +256,19 @@ bool moduleEnabled()
     return settings().defaultEnabled;
 }
 
-bool effectEnabled(const EffectDescriptor &effect)
+bool serviceEnabled(const char *service)
 {
     for (const std::string &name : settings().disabledEffects) {
-        if (name == effect.service) {
+        if (name == service) {
             return false;
         }
     }
     return true;
+}
+
+bool effectEnabled(const EffectDescriptor &effect)
+{
+    return serviceEnabled(effect.service);
 }
 
 const std::vector<const EffectDescriptor *> &effectRegistry()
@@ -243,6 +277,25 @@ const std::vector<const EffectDescriptor *> &effectRegistry()
         &dropShadowEffect(),       &boxBlurEffect(),    &rectBlurEffect(),       &brightnessEffect(),      &liftGammaGainEffect(),
         &frei0rSquareBlurEffect(), &frei0rGlowEffect(), &frei0rSoftGlowEffect(), &frei0rSharpnessEffect(), &transformEffect()};
     return effects;
+}
+
+const std::vector<const TransitionDescriptor *> &transitionRegistry()
+{
+    static const std::vector<const TransitionDescriptor *> transitions = {&compositeTransition()};
+    return transitions;
+}
+
+const TransitionDescriptor *findTransition(const char *service)
+{
+    if (!service) {
+        return nullptr;
+    }
+    for (const TransitionDescriptor *transition : transitionRegistry()) {
+        if (!strcmp(transition->service, service)) {
+            return transition;
+        }
+    }
+    return nullptr;
 }
 
 const EffectDescriptor *findEffect(const char *service)
@@ -277,5 +330,6 @@ void mlt_register(mlt_repository repository)
     }
     pinModule();
     mlt_events_listen(mlt_factory_event_object(), nullptr, "filter-create-done", onFilterCreated);
+    mlt_events_listen(mlt_factory_event_object(), nullptr, "transition-create-done", onTransitionCreated);
 }
 }

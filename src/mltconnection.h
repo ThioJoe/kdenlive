@@ -41,7 +41,7 @@ public:
     /** @brief Describes the state of GPU effect processing.
      *  This initializes CUDA if it was not done yet, which can take a moment: do not call it from the GUI thread.
      *  @param available set to true if effects can run on the GPU
-     *  @param effects set to the MLT services of the effects that can run on the GPU */
+     *  @param effects set to the MLT services of the effects that can run on the GPU, transitions as transition:<service> */
     static QString gpuEffectsStatus(bool *available = nullptr, QStringList *effects = nullptr);
 
 protected:

@@ -94,6 +94,11 @@ QString MltConnection::gpuEffectsStatus(bool *available, QStringList *effects)
     }
     if (effects) {
         *effects = QString::fromUtf8(status.get("effects")).split(QLatin1Char(','), Qt::SkipEmptyParts);
+        // Transitions are listed as transition:<service>
+        const QStringList transitions = QString::fromUtf8(status.get("transitions")).split(QLatin1Char(','), Qt::SkipEmptyParts);
+        for (const QString &transition : transitions) {
+            effects->append(QStringLiteral("transition:") + transition);
+        }
     }
     if (!usable) {
         return i18n("Not available: %1", QString::fromUtf8(status.get("status")));

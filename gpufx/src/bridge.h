@@ -13,9 +13,12 @@ namespace gpufx {
 
 /** Replaces filter->process so that frames of this filter go through the bridge. */
 void wrapFilter(mlt_filter filter, const EffectDescriptor &effect);
+/** The same for a transition */
+void wrapTransition(mlt_transition transition, const TransitionDescriptor &descriptor);
 
-/** Module wide switches (environment, MLT global properties, per filter). */
+/** Module wide switches (environment, MLT global properties, per service). */
 bool moduleEnabled();
+bool serviceEnabled(const char *service);
 bool effectEnabled(const EffectDescriptor &effect);
 
 } // namespace gpufx

@@ -71,6 +71,7 @@ add_library(mltgpufx MODULE
     src/effect_qtblend.cpp
     src/gpu_runtime.cpp
     src/module.cpp
+    src/qt_draw.cpp
     src/qt_raster.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/gpufx_ptx.cpp"
 )

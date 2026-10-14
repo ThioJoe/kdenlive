@@ -27,4 +27,5 @@
     X(gpufx_softglow_highlights)                                                                                                                               \
     X(gpufx_unsharp_h)                                                                                                                                         \
     X(gpufx_unsharp_v)                                                                                                                                         \
-    X(gpufx_qt_draw_image)
+    X(gpufx_qt_draw_image)                                                                                                                                     \
+    X(gpufx_alpha_check)

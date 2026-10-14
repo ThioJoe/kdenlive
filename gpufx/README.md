@@ -16,18 +16,19 @@ installed in MLT's module directory.
 
 ## Accelerated effects
 
-| Kdenlive effect                     | MLT service         | Notes |
-|-------------------------------------|---------------------|-------|
-| Drop Shadow                         | `dropshadow`        | Matches the CPU filter (Qt's `QGraphicsDropShadowEffect`): same alpha, colors within one level, 8-bit only |
-| BoxBlur                             | `box_blur`          | Identical output, 8-bit only |
-| Box Blur                            | `boxblur`           | Identical output |
-| Intensity (Brightness), Fade in/out | `brightness`        | Lightweight, see below |
-| Lift/gamma/gain                     | `lift_gamma_gain`   | Lightweight, see below |
-| Square Blur                         | `frei0r.squareblur` | Identical output |
-| Glow                                | `frei0r.glow`       | Identical output |
-| Soft Glow                           | `frei0r.softglow`   | Identical output |
-| Sharpen                             | `frei0r.sharpness`  | Identical output |
-| Transform                           | `qtblend`           | Matches the CPU filter (QPainter): same alpha, colors within one level. Alpha blend compositing and 8-bit only, see below |
+| Kdenlive effect                     | MLT service          | Notes |
+|-------------------------------------|----------------------|-------|
+| Drop Shadow                         | `dropshadow`         | Matches the CPU filter (Qt's `QGraphicsDropShadowEffect`): same alpha, colors within one level, 8-bit only |
+| BoxBlur                             | `box_blur`           | Identical output, 8-bit only |
+| Box Blur                            | `boxblur`            | Identical output |
+| Intensity (Brightness), Fade in/out | `brightness`         | Lightweight, see below |
+| Lift/gamma/gain                     | `lift_gamma_gain`    | Lightweight, see below |
+| Square Blur                         | `frei0r.squareblur`  | Identical output |
+| Glow                                | `frei0r.glow`        | Identical output |
+| Soft Glow                           | `frei0r.softglow`    | Identical output |
+| Sharpen                             | `frei0r.sharpness`   | Identical output |
+| Transform                           | `qtblend`            | Matches the CPU filter (QPainter): same alpha, colors within one level. Alpha blend compositing and 8-bit only, see below |
+| Track compositing                   | `qtblend` transition | Matches the CPU transition: same alpha, colors within one level, see below |
 
 Any mix of accelerated and CPU-only effects works: each accelerated effect is
 moved to the GPU for its own processing, and the others stay on the CPU.
@@ -63,6 +64,24 @@ rotation combined with *Distort*, and with MLT 7.38, scaling a clip down
 (that version scales with `QImage::scaled()`). The geometry follows MLT 7.38
 to 7.44; with a newer MLT the effect stays on the CPU until the module is
 updated, unless `MLT_GPUFX_QTBLEND=force` is set.
+
+### Track compositing
+
+Kdenlive composites every video track onto the tracks below with MLT's
+`qtblend` transition, which draws with QPainter like the Transform effect and
+is reproduced the same way. The GPU version follows MLT's shortcuts too: a
+top track without transparency replaces the tracks below without blending
+(the opacity check runs on the GPU when the image is there).
+
+Copying both images to the GPU and the result back costs about as much as
+compositing them on the CPU, so a transition only runs on the GPU when one of
+its images is already there: a clip with accelerated effects, or the result
+of the transition below. With two composited tracks or more, the whole stack
+is drawn on the GPU: every clip image is uploaded once and the final frame is
+downloaded once.
+
+The same cases as for Transform stay on the CPU (blend modes, 10-bit,
+rotation with *Distort*, scaling down with MLT 7.38).
 
 ## Requirements
 

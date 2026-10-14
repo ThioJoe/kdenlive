@@ -546,6 +546,180 @@ void testTransform(mlt_profile profile)
     }
 }
 
+/* A producer of a fixed RGBA image, standing for a clip */
+int patternGetImage(mlt_frame frame, uint8_t **image, mlt_image_format *format, int *width, int *height, int)
+{
+    auto *pattern = static_cast<const Image *>(mlt_properties_get_data(MLT_FRAME_PROPERTIES(frame), "_pattern", nullptr));
+    const int size = pattern->width * pattern->height * 4;
+    auto *buffer = static_cast<uint8_t *>(mlt_pool_alloc(size));
+    memcpy(buffer, pattern->pixels.data(), size_t(size));
+    mlt_frame_set_image(frame, buffer, size, mlt_pool_release);
+    *image = buffer;
+    *format = mlt_image_rgba;
+    *width = pattern->width;
+    *height = pattern->height;
+    return 0;
+}
+
+int patternGetFrame(mlt_producer producer, mlt_frame_ptr frame, int)
+{
+    *frame = mlt_frame_init(MLT_PRODUCER_SERVICE(producer));
+    mlt_properties properties = MLT_FRAME_PROPERTIES(*frame);
+    auto *pattern = static_cast<const Image *>(mlt_properties_get_data(MLT_PRODUCER_PROPERTIES(producer), "_pattern", nullptr));
+    mlt_properties_set_data(properties, "_pattern", const_cast<Image *>(pattern), 0, nullptr, nullptr);
+    mlt_properties_set_int(properties, "format", mlt_image_rgba);
+    mlt_properties_set_int(properties, "width", pattern->width);
+    mlt_properties_set_int(properties, "height", pattern->height);
+    mlt_properties_set_int(properties, "meta.media.width", pattern->width);
+    mlt_properties_set_int(properties, "meta.media.height", pattern->height);
+    mlt_frame_set_aspect_ratio(*frame, 1.0);
+    mlt_frame_set_position(*frame, mlt_producer_position(producer));
+    mlt_frame_push_get_image(*frame, patternGetImage);
+    mlt_producer_prepare_next(producer);
+    return 0;
+}
+
+mlt_producer patternProducer(mlt_profile profile, const Image *pattern)
+{
+    mlt_producer producer = mlt_producer_new(profile);
+    producer->get_frame = patternGetFrame;
+    mlt_properties_set_data(MLT_PRODUCER_PROPERTIES(producer), "_pattern", const_cast<Image *>(pattern), 0, nullptr, nullptr);
+    mlt_properties_set_position(MLT_PRODUCER_PROPERTIES(producer), "length", 100);
+    mlt_properties_set_position(MLT_PRODUCER_PROPERTIES(producer), "out", 99);
+    return producer;
+}
+
+struct Track
+{
+    const Image *image;
+    std::vector<FilterSpec> filters;
+    Properties transition; // qtblend transition properties onto track 0
+};
+
+/** Renders a timeline like Kdenlive's: one track per entry, the first one at
+ *  the bottom, each other track composited onto it by a qtblend transition. */
+Image renderTimeline(mlt_profile profile, const std::vector<Track> &tracks, bool cpu, const Properties &frameProperties, mlt_position position = 0)
+{
+    mlt_tractor tractor = mlt_tractor_new();
+    mlt_multitrack multitrack = mlt_tractor_multitrack(tractor);
+    mlt_field field = mlt_tractor_field(tractor);
+    std::vector<mlt_producer> producers;
+    std::vector<mlt_filter> filters;
+    std::vector<mlt_transition> transitions;
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        mlt_producer producer = patternProducer(profile, tracks[i].image);
+        for (mlt_filter filter : createFilters(profile, tracks[i].filters, cpu)) {
+            mlt_producer_attach(producer, filter);
+            filters.push_back(filter);
+        }
+        mlt_multitrack_connect(multitrack, producer, int(i));
+        producers.push_back(producer);
+        if (i > 0) {
+            mlt_transition transition = mlt_factory_transition(profile, "qtblend", nullptr);
+            mlt_properties properties = MLT_TRANSITION_PROPERTIES(transition);
+            mlt_properties_set_int(properties, "always_active", 1);
+            for (const auto &property : tracks[i].transition) {
+                mlt_properties_set(properties, property.first, property.second.c_str());
+            }
+            mlt_properties_set_int(properties, "_gpufx.disable", cpu ? 1 : 0);
+            mlt_field_plant_transition(field, transition, 0, int(i));
+            transitions.push_back(transition);
+        }
+    }
+    mlt_producer_seek(MLT_TRACTOR_PRODUCER(tractor), position);
+    mlt_frame frame = nullptr;
+    mlt_service_get_frame(MLT_TRACTOR_SERVICE(tractor), &frame, 0);
+    Image output;
+    if (frame) {
+        for (const auto &property : frameProperties) {
+            mlt_properties_set(MLT_FRAME_PROPERTIES(frame), property.first, property.second.c_str());
+        }
+        uint8_t *image = nullptr;
+        mlt_image_format format = mlt_image_rgba;
+        int width = profile->width;
+        int height = profile->height;
+        if (!mlt_frame_get_image(frame, &image, &format, &width, &height, 0) && image && format == mlt_image_rgba) {
+            output.width = width;
+            output.height = height;
+            output.pixels.assign(image, image + size_t(width) * size_t(height) * 4);
+        } else {
+            fprintf(stderr, "timeline: get_image failed, format %d\n", int(format));
+        }
+        mlt_frame_close(frame);
+    }
+    for (mlt_transition transition : transitions) {
+        mlt_transition_close(transition);
+    }
+    mlt_tractor_close(tractor);
+    for (mlt_filter filter : filters) {
+        mlt_filter_close(filter);
+    }
+    for (mlt_producer producer : producers) {
+        mlt_producer_close(producer);
+    }
+    return output;
+}
+
+void expectSameTimeline(mlt_profile profile, const std::vector<Track> &tracks, const Properties &frameProperties, const char *what, mlt_position position = 0)
+{
+    const Image cpu = renderTimeline(profile, tracks, true, frameProperties, position);
+    const Image gpu = renderTimeline(profile, tracks, false, frameProperties, position);
+    const Difference d = compare(cpu, gpu);
+    if (d.sizeMismatch) {
+        check(false, "%s: output size mismatch", what);
+        return;
+    }
+    check(d.maxAlpha == 0 && d.maxPremultiplied <= 1.0, "%s: alpha diff %d, premultiplied diff %.2f, channel diff %d (%ld pixels)", what, d.maxAlpha,
+          d.maxPremultiplied, d.maxChannel, d.pixels);
+}
+
+/** Track compositing: MLT's qtblend transition */
+void testCompositing(mlt_profile profile)
+{
+    if (!hasFilter("qtblend") || !mlt_properties_get_data(mlt_repository_transitions(mlt_factory_repository()), "qtblend", nullptr)) {
+        printf("SKIP: MLT has no qtblend transition\n");
+        return;
+    }
+    const Properties smooth = {{"consumer.rescale", "bilinear"}};
+    const Properties nearest = {{"consumer.rescale", "nearest"}};
+    const Image background = makeImage(160, 90, 4);
+    const Image clip1 = makeImage(160, 90, 2);
+    const Image clip2 = makeImage(120, 80, 1);
+    const Image clip3 = makeImage(160, 90, 0);
+    // Picture in picture on two tracks, Kdenlive style compositing (no rectangle)
+    const std::vector<Track> pip = {
+        {&background, {}, {}},
+        {&clip1, {{"qtblend", {{"rect", "10 5 80 45 1"}}}}, {}},
+        {&clip2, {{"qtblend", {{"rect", "70 30 80 50 0.8"}, {"rotation", "12"}}}, {"dropshadow", {{"radius", "3"}}}}, {}},
+    };
+    for (const Properties *frameProperties : {&smooth, &nearest}) {
+        expectSameTimeline(profile, pip, *frameProperties, frameProperties == &smooth ? "picture in picture, smooth" : "picture in picture, nearest");
+    }
+    // Transitions with their own geometry, opacity and rotation
+    expectSameTimeline(profile,
+                       {{&background, {}, {}},
+                        {&clip3, {{"box_blur", {{"hradius", "2"}, {"vradius", "2"}}}}, {{"rect", "20 10 100 60 0.7"}}},
+                        {&clip2, {{"brightness", {{"level", "0.8"}}}}, {{"rect", "-10 -5 120 70 1"}, {"rotation", "-8"}, {"rotate_center", "1"}}}},
+                       smooth, "transition geometry");
+    // An opaque top track hides the tracks below
+    expectSameTimeline(profile, {{&background, {}, {}}, {&clip2, {}, {}}, {&clip1, {{"box_blur", {{"hradius", "3"}, {"vradius", "1"}}}}, {}}}, smooth,
+                       "opaque top track");
+
+    if (g_mock.active()) {
+        // The whole timeline stays on the GPU: each clip is uploaded once, the
+        // result downloaded once (besides the results of the opacity checks)
+        g_mock.reset();
+        const Image result = renderTimeline(profile, pip, false, smooth);
+        const MockCudaStats stats = g_mock.stats();
+        const uint64_t imageBytes = uint64_t(background.pixels.size() + clip1.pixels.size() + clip2.pixels.size());
+        const uint64_t frameBytes = uint64_t(result.pixels.size());
+        check(!result.pixels.empty() && stats.downloadedBytes < frameBytes + 64 && stats.uploadedBytes < imageBytes + imageBytes / 2,
+              "timeline: %llu bytes downloaded for a %llu bytes frame, %llu bytes uploaded for %llu bytes of images", (unsigned long long)stats.downloadedBytes,
+              (unsigned long long)frameBytes, (unsigned long long)stats.uploadedBytes, (unsigned long long)imageBytes);
+        check(stats.misuse == 0, "timeline: %llu invalid CUDA calls", (unsigned long long)stats.misuse);
+    }
+}
+
 void testChains(mlt_profile profile)
 {
     const Image input = makeImage(120, 80, 2);
@@ -761,6 +935,7 @@ int main(int argc, char **argv)
     testColor(profile);
     testFrei0r(profile);
     testTransform(profile);
+    testCompositing(profile);
     testChains(profile);
     testProducer(profile);
     testGlobalSwitch(profile);

@@ -620,6 +620,8 @@ GPUFX_KERNEL void gpufx_unsharp_v(const gpufx_u32 *__restrict__ sums, const gpuf
  * 16-bit pipeline does, including the groups of 4 pixels its SSE4 format
  * conversions work on: every thread computes the whole group of its pixel.
  *
+ * under: the destination content before drawing, or null for a destination
+ *        filled with background
  * rows: per destination row, first span, span count, first run, run count
  * spans: x, length, coverage
  * runs: x, length, then the source position of the first pixel: 16.16 fixed
@@ -829,9 +831,9 @@ GPUFX_DEV void gpufx_qt_bounds(int max, int &v1, int &v2)
     }
 }
 
-GPUFX_KERNEL void gpufx_qt_draw_image(const gpufx_u32 *__restrict__ src, int sw, int sh, gpufx_u32 *__restrict__ dst, int dw, int dh,
-                                      const int *__restrict__ rows, const int *__restrict__ spans, const int *__restrict__ runs, int mode, int fdx, int fdy,
-                                      int opacity, gpufx_u32 background)
+GPUFX_KERNEL void gpufx_qt_draw_image(const gpufx_u32 *__restrict__ src, int sw, int sh, const gpufx_u32 *__restrict__ under, gpufx_u32 background,
+                                      gpufx_u32 *__restrict__ dst, int dw, int dh, const int *__restrict__ rows, const int *__restrict__ spans,
+                                      const int *__restrict__ runs, int mode, int fdx, int fdy, int opacity)
 {
     const int x = GPUFX_GLOBAL_X;
     const int y = GPUFX_GLOBAL_Y;
@@ -849,7 +851,7 @@ GPUFX_KERNEL void gpufx_qt_draw_image(const gpufx_u32 *__restrict__ src, int sw,
     }
     const size_t index = size_t(y) * size_t(dw) + size_t(x);
     if (!run) {
-        dst[index] = background;
+        dst[index] = under ? under[index] : background;
         return;
     }
     const int start = run[0];
@@ -935,10 +937,14 @@ GPUFX_KERNEL void gpufx_qt_draw_image(const gpufx_u32 *__restrict__ src, int sw,
         gpufx_qt_convert(texels, source, count == 4);
     }
 
-    // The destination still holds the background
-    const gpufx_u32 backgrounds[4] = {background, background, background, background};
+    // The destination content: the image below or the background
+    gpufx_u32 targets[4];
+    GPUFX_UNROLL
+    for (int k = 0; k < 4; ++k) {
+        targets[k] = under ? under[size_t(y) * size_t(dw) + size_t(start + gpufx_min(group + k, length - 1))] : background;
+    }
     GpufxRgba64 dest[4];
-    gpufx_qt_convert(backgrounds, dest, count == 4);
+    gpufx_qt_convert(targets, dest, count == 4);
 
     GpufxRgba64 blended[4];
     GPUFX_UNROLL
@@ -947,4 +953,15 @@ GPUFX_KERNEL void gpufx_qt_draw_image(const gpufx_u32 *__restrict__ src, int sw,
         blended[k] = gpufx_qt_source_over(source[k], dest[k], (coverage * gpufx_u32(opacity)) >> 8);
     }
     dst[index] = gpufx_qt_store(blended, count, i - group);
+}
+
+/* mlt_image_is_opaque() of an RGBA image: transparent is set to 1 when any
+ * pixel has an alpha below 255 (every thread that finds one writes the same
+ * value). */
+GPUFX_KERNEL void gpufx_alpha_check(const gpufx_u32 *__restrict__ src, int n, int *__restrict__ transparent)
+{
+    const int i = GPUFX_GLOBAL_X;
+    if (i < n && (src[i] >> 24) != 255u) {
+        *transparent = 1;
+    }
 }

@@ -712,7 +712,13 @@ void KdenliveSettingsDialog::initSdlPage(bool gpuAllowed)
         const QPair<QString, QStringList> result = gpuWatcher->result();
         QStringList names;
         for (const QString &service : result.second) {
-            names << (EffectsRepository::get()->exists(service) ? EffectsRepository::get()->getName(service) : service);
+            if (service == QLatin1String("transition:qtblend")) {
+                names << i18n("Track compositing");
+            } else if (service.startsWith(QLatin1String("transition:"))) {
+                names << service.section(QLatin1Char(':'), 1);
+            } else {
+                names << (EffectsRepository::get()->exists(service) ? EffectsRepository::get()->getName(service) : service);
+            }
         }
         QString text = result.first;
         if (!names.isEmpty()) {
