@@ -1214,6 +1214,8 @@ void RenderWidget::startRendering(RenderJobItem *item)
     if (!KdenliveSettings::hwDecoding().isEmpty()) {
         env.insert(QLatin1String("MLT_AVFORMAT_HWACCEL"), KdenliveSettings::hwDecoding());
     }
+    // GPU effects (gpufx MLT module) in the render process
+    env.insert(QLatin1String("MLT_GPUFX"), KdenliveSettings::gpu_effects() ? QStringLiteral("1") : QStringLiteral("0"));
     proc.setProgram(KdenliveSettings::kdenliverendererpath());
     proc.setProcessEnvironment(env);
     if (KdenliveSettings::keepRenderLogFiles()) {

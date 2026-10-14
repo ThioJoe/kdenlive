@@ -104,6 +104,8 @@ SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 #include <KToggleFullScreenAction>
 #include <KToolBar>
 #include <KXMLGUIFactory>
+#include <mlt++/MltFilter.h>
+#include <mlt++/MltProfile.h>
 
 #include <KConfigGroup>
 #include <QAction>
@@ -3733,6 +3735,17 @@ void MainWindow::slotCopyDebugInfo()
         debuginfo.append(QStringLiteral("GPU: %1\n").arg(m_clipMonitor->getGPUInfo().join(QLatin1Char('/'))));
     }
     debuginfo.append(QStringLiteral("Movit (GPU): %1\n").arg(KdenliveSettings::gpu_accel() ? QStringLiteral("enabled") : QStringLiteral("disabled")));
+    {
+        Mlt::Profile profile;
+        Mlt::Filter gpufx(profile, "gpufx", "noinit");
+        QString gpuEffects = KdenliveSettings::gpu_effects() ? QStringLiteral("enabled") : QStringLiteral("disabled");
+        if (!gpufx.is_valid()) {
+            gpuEffects.append(QStringLiteral(", module not installed"));
+        } else {
+            gpuEffects.append(QStringLiteral(", %1, %2 frames on GPU").arg(QString::fromUtf8(gpufx.get("status")), QString::fromUtf8(gpufx.get("gpu_frames"))));
+        }
+        debuginfo.append(QStringLiteral("GPU effects (CUDA): %1\n").arg(gpuEffects));
+    }
     debuginfo.append(QStringLiteral("Track Compositing: %1\n").arg(TransitionsRepository::get()->getCompositingTransition()));
     QClipboard *clipboard = QApplication::clipboard();
     clipboard->setText(debuginfo);

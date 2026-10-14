@@ -531,6 +531,10 @@
       <label>Use Movit for GPU accelerated display and effects.</label>
       <default>false</default>
     </entry>
+    <entry name="gpu_effects" type="Bool">
+      <label>Process the effects that support it on the GPU (CUDA).</label>
+      <default>true</default>
+    </entry>
     <entry name="audio_scrub" type="Bool">
     <label>Enable Audio Scrubbing</label>
     <default>true</default>

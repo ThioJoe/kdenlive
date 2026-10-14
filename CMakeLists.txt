@@ -36,6 +36,13 @@ option(USE_DBUS "Build components using DBus" ${USE_DBUS_DEFAULT})
 
 option(BUILD_DESIGNERPLUGIN "Build plugin for Qt Designer" OFF)
 
+# MLT module running some effects on NVIDIA GPUs, see gpufx/README.md
+set(BUILD_GPUFX_DEFAULT ON)
+if(APPLE)
+    set(BUILD_GPUFX_DEFAULT OFF)
+endif()
+option(BUILD_GPUFX "Build the MLT module accelerating effects with CUDA on NVIDIA GPUs" ${BUILD_GPUFX_DEFAULT})
+
 # Minimum versions of main dependencies.
 set(MLT_MIN_MAJOR_VERSION 7)
 set(MLT_MIN_MINOR_VERSION 38)
@@ -227,6 +234,11 @@ if(CRASH_AUTO_TEST)
 endif()
 
 set(FFMPEG_SUFFIX "" CACHE STRING "FFmpeg custom suffix")
+if(BUILD_GPUFX)
+    # Sets KDENLIVE_GPUFX_MODULE_DIR, used in config-kdenlive.h
+    add_subdirectory(gpufx)
+endif()
+add_feature_info(GPUFX ${BUILD_GPUFX} "GPU (CUDA) acceleration of some effects through an MLT module")
 configure_file(config-kdenlive.h.cmake config-kdenlive.h @ONLY)
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
 

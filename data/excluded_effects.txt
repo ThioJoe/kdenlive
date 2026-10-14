@@ -28,6 +28,8 @@ resize
 rescale
 resample
 transition
+# Status service of the GPU effects module (gpufx), not an effect
+gpufx
 
 #####################
 # DEPRECATED

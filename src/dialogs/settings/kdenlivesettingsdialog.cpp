@@ -9,9 +9,11 @@ SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 #include "dialogs/customcamcorderdialog.h"
 #include "dialogs/wizard.h"
 #include "doc/kdenlivedoc.h"
+#include "effects/effectsrepository.hpp"
 #include "filefilter.h"
 #include "kdenlivesettings.h"
 #include "mainwindow.h"
+#include "mltconnection.h"
 #include "monitor/monitor.h"
 #include "pluginssettings.h"
 #include "profiles/profilemodel.hpp"
@@ -40,6 +42,7 @@ SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 #include <QAudioDevice>
 #include <QButtonGroup>
 #include <QDir>
+#include <QFutureWatcher>
 #include <QGuiApplication>
 #include <QInputDialog>
 #include <QMediaDevices>
@@ -701,6 +704,32 @@ void KdenliveSettingsDialog::initSdlPage(bool gpuAllowed)
     // enable GPU accel only if Movit is found
     m_configSdl.kcfg_gpu_accel->setEnabled(gpuAllowed);
     m_configSdl.kcfg_gpu_accel->setToolTip(i18n("GPU processing needs MLT compiled with Movit and Rtaudio modules"));
+
+    // GPU effects: checking the GPU can take a moment the first time
+    m_configSdl.gpu_effects_status->setText(i18n("Checking the GPU…"));
+    auto *gpuWatcher = new QFutureWatcher<QPair<QString, QStringList>>(this);
+    connect(gpuWatcher, &QFutureWatcherBase::finished, this, [this, gpuWatcher]() {
+        const QPair<QString, QStringList> result = gpuWatcher->result();
+        QStringList names;
+        for (const QString &service : result.second) {
+            names << (EffectsRepository::get()->exists(service) ? EffectsRepository::get()->getName(service) : service);
+        }
+        QString text = result.first;
+        if (!names.isEmpty()) {
+            text.append(QLatin1Char('\n') + i18n("Accelerated effects: %1", names.join(QStringLiteral(", "))));
+        }
+        m_configSdl.gpu_effects_status->setText(text);
+        gpuWatcher->deleteLater();
+    });
+    gpuWatcher->setFuture(QtConcurrent::run([]() {
+        bool available = false;
+        QStringList effects;
+        QString status = MltConnection::gpuEffectsStatus(&available, &effects);
+        if (!available) {
+            effects.clear();
+        }
+        return qMakePair(status, effects);
+    }));
     if (!getBlackMagicOutputDeviceList(m_configSdl.kcfg_blackmagic_output_device)) {
         // No blackmagic card found
         m_configSdl.kcfg_external_display->setEnabled(false);
@@ -1525,6 +1554,12 @@ void KdenliveSettingsDialog::updateSettings()
         KdenliveSettings::setShuttlebuttons(maps);
     }
 #endif
+
+    if (m_configSdl.kcfg_gpu_effects->isChecked() != KdenliveSettings::gpu_effects()) {
+        // Takes effect immediately, the rendered result does not change
+        KdenliveSettings::setGpu_effects(m_configSdl.kcfg_gpu_effects->isChecked());
+        MltConnection::applyGpuEffectsSetting();
+    }
 
     bool restart = false;
     if (m_configSdl.kcfg_gpu_accel->isChecked() != KdenliveSettings::gpu_accel()) {

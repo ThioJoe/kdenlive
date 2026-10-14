@@ -5,6 +5,7 @@ SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 */
 
 #include "mltconnection.h"
+#include "config-kdenlive.h"
 #include "core.h"
 #include "kdenlivesettings.h"
 #include "mainwindow.h"
@@ -15,12 +16,15 @@ SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
+#include <QLibrary>
 #include <QTextStream>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <clocale>
 #include <lib/localeHandling.h>
 #include <mlt++/MltFactory.h>
+#include <mlt++/MltFilter.h>
+#include <mlt++/MltProfile.h>
 #include <mlt++/MltRepository.h>
 
 static void mlt_log_handler(void *service, int mlt_level, const char *format, va_list args)
@@ -68,6 +72,73 @@ static QString getShortPath(const QString &longPath)
 }
 #endif
 
+/** @brief Registers the gpufx MLT module (GPU effects) if MLT did not load it.
+ *  MLT only loads modules from its own directory, which is not where the module
+ *  ends up when Kdenlive is installed to another prefix than MLT. */
+static void loadGpuEffectsModule()
+{
+    mlt_repository repository = mlt_factory_repository();
+    const QString moduleDir = QStringLiteral(KDENLIVE_GPUFX_MODULE_DIR);
+    if (!repository || moduleDir.isEmpty() || mlt_properties_get_data(mlt_repository_filters(repository), "gpufx", nullptr)) {
+        return;
+    }
+    QStringList dirs;
+    if (QDir::isAbsolutePath(moduleDir)) {
+        dirs << moduleDir;
+    } else {
+        dirs << QDir::cleanPath(qApp->applicationDirPath() + QStringLiteral("/../") + moduleDir);
+        dirs << QDir::cleanPath(QStringLiteral(KDENLIVE_INSTALL_PREFIX) + QLatin1Char('/') + moduleDir);
+    }
+    const QStringList names = {QStringLiteral("libmltgpufx.so"), QStringLiteral("libmltgpufx.dll"), QStringLiteral("mltgpufx.dll")};
+    for (const QString &dir : std::as_const(dirs)) {
+        for (const QString &name : names) {
+            const QString path = QDir(dir).absoluteFilePath(name);
+            if (!QFile::exists(path)) {
+                continue;
+            }
+            QLibrary module(path);
+            auto registerModule = reinterpret_cast<void (*)(mlt_repository)>(module.resolve("mlt_register"));
+            if (registerModule) {
+                registerModule(repository);
+                qDebug() << "Loaded the GPU effects module" << path;
+                return;
+            }
+            qWarning() << "Cannot load the GPU effects module" << path << module.errorString();
+        }
+    }
+}
+
+void MltConnection::applyGpuEffectsSetting()
+{
+    if (mlt_properties global = mlt_global_properties()) {
+        mlt_properties_set(global, "gpufx.enabled", KdenliveSettings::gpu_effects() ? "1" : "0");
+    }
+}
+
+QString MltConnection::gpuEffectsStatus(bool *available, QStringList *effects)
+{
+    if (available) {
+        *available = false;
+    }
+    Mlt::Profile profile;
+    Mlt::Filter status(profile, "gpufx");
+    if (!status.is_valid()) {
+        return i18n("Not available in this build: the gpufx MLT module is not installed.");
+    }
+    const bool usable = status.get_int("available") != 0;
+    if (available) {
+        *available = usable;
+    }
+    if (effects) {
+        *effects = QString::fromUtf8(status.get("effects")).split(QLatin1Char(','), Qt::SkipEmptyParts);
+    }
+    if (!usable) {
+        return i18n("Not available: %1", QString::fromUtf8(status.get("status")));
+    }
+    return i18n("%1 (compute %2, CUDA driver %3)", QString::fromUtf8(status.get("device")), QString::fromUtf8(status.get("compute_capability")),
+                QString::fromUtf8(status.get("cuda_driver")));
+}
+
 std::unique_ptr<MltConnection> MltConnection::m_self;
 MltConnection::MltConnection(const QString &mltPath)
 {
@@ -95,6 +166,8 @@ MltConnection::MltConnection(const QString &mltPath)
     // After initialising the MLT factory, set the locale back from user default to C
     // to ensure numbers are always serialised with . as decimal point.
     m_repository = std::unique_ptr<Mlt::Repository>(Mlt::Factory::init());
+    loadGpuEffectsModule();
+    applyGpuEffectsSetting();
 
 #ifdef Q_OS_FREEBSD
     setlocale(MLT_LC_CATEGORY, nullptr);

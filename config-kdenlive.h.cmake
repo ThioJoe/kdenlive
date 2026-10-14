@@ -11,6 +11,11 @@
 
 #define FFMPEG_SUFFIX "@FFMPEG_SUFFIX@"
 
+/* Where the gpufx MLT module is installed (empty if not built), relative to
+   the install prefix unless absolute */
+#define KDENLIVE_GPUFX_MODULE_DIR "@KDENLIVE_GPUFX_MODULE_DIR@"
+#define KDENLIVE_INSTALL_PREFIX "@CMAKE_INSTALL_PREFIX@"
+
 #cmakedefine HAVE_MALLOC_H 1
 #cmakedefine HAVE_PTHREAD_H 1
 

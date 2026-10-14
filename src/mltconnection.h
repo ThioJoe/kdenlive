@@ -6,6 +6,7 @@ SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 #pragma once
 
 #include <QString>
+#include <QStringList>
 #include <memory>
 
 namespace Mlt {
@@ -33,6 +34,15 @@ public:
     /** @brief Updates the list of available Lumas
      */
     static void refreshLumas();
+
+    /** @brief Turns GPU processing of effects (gpufx MLT module) on or off according to the settings */
+    static void applyGpuEffectsSetting();
+
+    /** @brief Describes the state of GPU effect processing.
+     *  This initializes CUDA if it was not done yet, which can take a moment: do not call it from the GUI thread.
+     *  @param available set to true if effects can run on the GPU
+     *  @param effects set to the MLT services of the effects that can run on the GPU */
+    static QString gpuEffectsStatus(bool *available = nullptr, QStringList *effects = nullptr);
 
 protected:
     /** @brief Open connection to the MLT framework

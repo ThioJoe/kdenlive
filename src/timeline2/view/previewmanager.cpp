@@ -690,8 +690,10 @@ void PreviewManager::doPreviewRender(const QString &scene)
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
     if (!KdenliveSettings::hwDecoding().isEmpty()) {
         env.insert(QLatin1String("MLT_AVFORMAT_HWACCEL"), KdenliveSettings::hwDecoding());
-        m_previewProcess.setProcessEnvironment(env);
     }
+    // GPU effects (gpufx MLT module) in the preview render process
+    env.insert(QLatin1String("MLT_GPUFX"), KdenliveSettings::gpu_effects() ? QStringLiteral("1") : QStringLiteral("0"));
+    m_previewProcess.setProcessEnvironment(env);
     m_previewProcess.start(KdenliveSettings::kdenliverendererpath(), args);
     if (m_previewProcess.waitForStarted()) {
         qDebug() << " -  - -STARTING PREVIEW JOBS . . . STARTED: " << args;
