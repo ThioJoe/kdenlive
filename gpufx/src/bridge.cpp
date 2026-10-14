@@ -141,19 +141,36 @@ int cpuFallback(mlt_frame frame, mlt_filter filter, mlt_get_image cpuGetImage, u
     return cpuGetImage(frame, image, format, width, height, writable);
 }
 
-int runOnGpu(mlt_frame frame, mlt_filter filter, mlt_get_image cpuGetImage, const EffectDescriptor &effect, EffectJob &job, bool callerWantsDevice,
+/** Downloads an input image that only exists on the GPU, so that the CPU
+ *  filter can process it. Returns nullptr if that fails. */
+std::unique_ptr<uint8_t, void (*)(void *)> rescueInput(GpuScope &scope, const DeviceBuffer &in, size_t bytes)
+{
+    std::unique_ptr<uint8_t, void (*)(void *)> copy(static_cast<uint8_t *>(mlt_pool_alloc(int(bytes))), mlt_pool_release);
+    CUresult res = copy ? scope.download(copy.get(), in.ptr(), bytes) : CUDA_ERROR_OUT_OF_MEMORY;
+    if (res == CUDA_SUCCESS) {
+        res = scope.synchronize();
+    }
+    if (res != CUDA_SUCCESS) {
+        copy.reset();
+    }
+    return copy;
+}
+
+int runOnGpu(mlt_frame frame, mlt_filter filter, mlt_get_image cpuGetImage, const EffectDescriptor &effect, EffectPlan &plan, bool callerWantsDevice,
              bool lowerOnGpu, uint8_t **image, mlt_image_format *format, int *width, int *height, int writable)
 {
     mlt_properties properties = MLT_FRAME_PROPERTIES(frame);
     Runtime &runtime = Runtime::instance();
+    EffectJob &job = *plan.job;
 
     // Our filter entry, the stack now starts with the image source
     mlt_frame_pop_service(frame);
 
     uint8_t *input = nullptr;
     mlt_image_format inputFormat = mlt_image_rgba;
-    int w = *width;
-    int h = *height;
+    int w = plan.inputWidth > 0 ? plan.inputWidth : *width;
+    int h = plan.inputHeight > 0 ? plan.inputHeight : *height;
+    job.beforeFetch(frame);
     if (lowerOnGpu) {
         mlt_properties_set_int(properties, kWantDevice, 1);
     }
@@ -167,13 +184,27 @@ int runOnGpu(mlt_frame frame, mlt_filter filter, mlt_get_image cpuGetImage, cons
         *height = h;
         return error ? error : 1;
     }
-    if (inputFormat != mlt_image_rgba || w <= 0 || h <= 0) {
-        return cpuFallback(frame, filter, cpuGetImage, input, {nullptr, mlt_pool_release}, w, h, image, format, width, height, writable);
-    }
-
     const size_t bytes = size_t(w) * size_t(h) * 4;
     const bool inputOnDevice = deviceInput != nullptr;
     std::unique_ptr<uint8_t, void (*)(void *)> rescued(nullptr, mlt_pool_release);
+    if (inputFormat != mlt_image_rgba || w <= 0 || h <= 0 || !job.prepare(w, h)) {
+        if (inputOnDevice) {
+            GpuScope scope;
+            if (scope.ok()) {
+                rescued = rescueInput(scope, deviceInput->buffer, bytes);
+            }
+            if (!rescued) {
+                logError("%s: lost the GPU image", effect.service);
+                return 1;
+            }
+        }
+        job.restoreFrame(frame);
+        return cpuFallback(frame, filter, cpuGetImage, input, std::move(rescued), w, h, image, format, width, height, writable);
+    }
+
+    const int outW = plan.outputWidth > 0 ? plan.outputWidth : w;
+    const int outH = plan.outputHeight > 0 ? plan.outputHeight : h;
+    const size_t outBytes = size_t(outW) * size_t(outH) * 4;
     CUresult res = CUDA_ERROR_NOT_INITIALIZED;
     {
         GpuScope scope;
@@ -190,44 +221,54 @@ int runOnGpu(mlt_frame frame, mlt_filter filter, mlt_get_image cpuGetImage, cons
                 }
             }
             if (res == CUDA_SUCCESS) {
-                res = out.allocate(bytes);
+                res = out.allocate(outBytes);
             }
             if (res == CUDA_SUCCESS) {
-                res = job.run(scope, w, h, in.ptr(), out.ptr());
+                res = job.runResized(scope, w, h, in.ptr(), outW, outH, out.ptr());
             }
             if (res == CUDA_SUCCESS) {
                 if (callerWantsDevice) {
                     // The caller continues on the GPU: keep the result there
                     res = scope.synchronize();
+                    uint8_t *tag = input;
+                    if (res == CUDA_SUCCESS && outBytes != bytes) {
+                        // The host image stands for the GPU one, give it the right size
+                        tag = static_cast<uint8_t *>(mlt_pool_alloc(int(outBytes)));
+                        if (tag) {
+                            mlt_frame_set_image(frame, tag, int(outBytes), mlt_pool_release);
+                        } else {
+                            res = CUDA_ERROR_OUT_OF_MEMORY;
+                        }
+                    }
                     if (res == CUDA_SUCCESS) {
                         auto handoff = std::make_unique<DeviceImage>();
                         handoff->buffer = std::move(out);
-                        handoff->width = w;
-                        handoff->height = h;
-                        handoff->tag = input;
+                        handoff->width = outW;
+                        handoff->height = outH;
+                        handoff->tag = tag;
                         attachDeviceImage(properties, std::move(handoff));
-                        *image = input;
+                        *image = tag;
                         *format = mlt_image_rgba;
-                        *width = w;
-                        *height = h;
+                        *width = outW;
+                        *height = outH;
                         runtime.countFrame(true);
-                        logDebug("%s: %dx%d on GPU, kept on GPU", effect.service, w, h);
+                        logDebug("%s: %dx%d on GPU, kept on GPU", effect.service, outW, outH);
                         return 0;
                     }
                 } else {
-                    auto *result = static_cast<uint8_t *>(mlt_pool_alloc(int(bytes)));
-                    res = result ? scope.download(result, out.ptr(), bytes) : CUDA_ERROR_OUT_OF_MEMORY;
+                    auto *result = static_cast<uint8_t *>(mlt_pool_alloc(int(outBytes)));
+                    res = result ? scope.download(result, out.ptr(), outBytes) : CUDA_ERROR_OUT_OF_MEMORY;
                     if (res == CUDA_SUCCESS) {
                         res = scope.synchronize();
                     }
                     if (res == CUDA_SUCCESS) {
-                        mlt_frame_set_image(frame, result, int(bytes), mlt_pool_release);
+                        mlt_frame_set_image(frame, result, int(outBytes), mlt_pool_release);
                         *image = result;
                         *format = mlt_image_rgba;
-                        *width = w;
-                        *height = h;
+                        *width = outW;
+                        *height = outH;
                         runtime.countFrame(true);
-                        logDebug("%s: %dx%d on GPU", effect.service, w, h);
+                        logDebug("%s: %dx%d on GPU", effect.service, outW, outH);
                         return 0;
                     }
                     if (result) {
@@ -238,14 +279,7 @@ int runOnGpu(mlt_frame frame, mlt_filter filter, mlt_get_image cpuGetImage, cons
             runtime.handleError(res, effect.service);
             if (inputOnDevice && in.valid()) {
                 // The host image is stale: get the pixels back for the CPU filter
-                rescued.reset(static_cast<uint8_t *>(mlt_pool_alloc(int(bytes))));
-                CUresult copied = rescued ? scope.download(rescued.get(), in.ptr(), bytes) : CUDA_ERROR_OUT_OF_MEMORY;
-                if (copied == CUDA_SUCCESS) {
-                    copied = scope.synchronize();
-                }
-                if (copied != CUDA_SUCCESS) {
-                    rescued.reset();
-                }
+                rescued = rescueInput(scope, in, bytes);
             }
         } else if (inputOnDevice) {
             // No usable context, the input only exists on the GPU
@@ -257,6 +291,7 @@ int runOnGpu(mlt_frame frame, mlt_filter filter, mlt_get_image cpuGetImage, cons
         return 1;
     }
     logDebug("%s: falling back to the CPU", effect.service);
+    job.restoreFrame(frame);
     return cpuFallback(frame, filter, cpuGetImage, input, std::move(rescued), w, h, image, format, width, height, writable);
 }
 
@@ -319,7 +354,7 @@ int bridgeGetImage(mlt_frame frame, uint8_t **image, mlt_image_format *format, i
     if (!Runtime::instance().ensureInitialized()) {
         return cpuGetImage(frame, image, format, width, height, writable);
     }
-    return runOnGpu(frame, filter, cpuGetImage, effect, *plan.job, callerWantsDevice, lowerOnGpu, image, format, width, height, writable);
+    return runOnGpu(frame, filter, cpuGetImage, effect, plan, callerWantsDevice, lowerOnGpu, image, format, width, height, writable);
 }
 
 mlt_frame wrappedProcess(mlt_filter filter, mlt_frame frame)

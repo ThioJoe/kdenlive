@@ -207,8 +207,13 @@ std::vector<mlt_filter> createFilters(mlt_profile profile, const std::vector<Fil
     return filters;
 }
 
-/** Runs the filters (in attach order) over a frame holding the image. */
-Image render(mlt_profile profile, const std::vector<FilterSpec> &specs, const Image &input, bool cpu, mlt_position position = 0)
+typedef std::vector<std::pair<const char *, std::string>> Properties;
+
+/** Runs the filters (in attach order) over a frame holding the image.
+ *  frameProperties are set on the frame, and the output is requested at
+ *  requestWidth x requestHeight (default: the input size). */
+Image render(mlt_profile profile, const std::vector<FilterSpec> &specs, const Image &input, bool cpu, mlt_position position = 0,
+             const Properties &frameProperties = {}, int requestWidth = 0, int requestHeight = 0)
 {
     std::vector<mlt_filter> filters = createFilters(profile, specs, cpu);
     mlt_frame frame = mlt_frame_init(nullptr);
@@ -220,14 +225,19 @@ Image render(mlt_profile profile, const std::vector<FilterSpec> &specs, const Im
     mlt_properties_set_int(properties, "format", mlt_image_rgba);
     mlt_properties_set_int(properties, "width", input.width);
     mlt_properties_set_int(properties, "height", input.height);
+    mlt_properties_set_int(properties, "meta.media.width", input.width);
+    mlt_properties_set_int(properties, "meta.media.height", input.height);
+    for (const auto &property : frameProperties) {
+        mlt_properties_set(properties, property.first, property.second.c_str());
+    }
     mlt_frame_set_position(frame, position);
     for (mlt_filter filter : filters) {
         mlt_filter_process(filter, frame);
     }
     uint8_t *image = nullptr;
     mlt_image_format format = mlt_image_rgba;
-    int width = input.width;
-    int height = input.height;
+    int width = requestWidth > 0 ? requestWidth : input.width;
+    int height = requestHeight > 0 ? requestHeight : input.height;
     const int error = mlt_frame_get_image(frame, &image, &format, &width, &height, 0);
     Image output;
     if (!error && image && format == mlt_image_rgba) {
@@ -301,15 +311,19 @@ std::string describe(const std::vector<FilterSpec> &specs)
 /** Renders on CPU and GPU and checks the results. exact: identical pixels,
  *  otherwise colors may differ by 1 (Qt un-premultiplies with an approximate
  *  reciprocal) and alpha must be identical. */
-void expectSame(mlt_profile profile, const std::vector<FilterSpec> &specs, const Image &input, bool exact, mlt_position position = 0)
+void expectSame(mlt_profile profile, const std::vector<FilterSpec> &specs, const Image &input, bool exact, mlt_position position = 0,
+                const Properties &frameProperties = {}, int requestWidth = 0, int requestHeight = 0)
 {
     if (!hasFilters(specs)) {
         return;
     }
-    const Image cpu = render(profile, specs, input, true, position);
-    const Image gpu = render(profile, specs, input, false, position);
+    const Image cpu = render(profile, specs, input, true, position, frameProperties, requestWidth, requestHeight);
+    const Image gpu = render(profile, specs, input, false, position, frameProperties, requestWidth, requestHeight);
     const Difference d = compare(cpu, gpu);
-    const std::string what = describe(specs) + " on " + std::to_string(input.width) + "x" + std::to_string(input.height);
+    std::string what = describe(specs) + " on " + std::to_string(input.width) + "x" + std::to_string(input.height);
+    for (const auto &property : frameProperties) {
+        what += std::string(", ") + property.first + "=" + property.second;
+    }
     if (d.sizeMismatch) {
         check(false, "%s: output size mismatch", what.c_str());
         return;
@@ -455,6 +469,80 @@ void testFrei0r(mlt_profile profile)
         g_mock.reset();
         render(profile, {{"frei0r.squareblur", {{"Kernel size", "0.1"}, {"threads", "0"}}}}, input, false);
         check(mlt_slices_count_normal() == 1 || g_mock.stats().launches == 0, "a sliced frei0r filter ran on the GPU");
+    }
+}
+
+/** Kdenlive's Transform: MLT's qtblend filter, drawn by QPainter on the CPU */
+void testTransform(mlt_profile profile)
+{
+    if (!hasFilter("qtblend")) {
+        printf("SKIP: MLT has no qtblend filter\n");
+        return;
+    }
+    const Properties smooth = {{"consumer.rescale", "bilinear"}};
+    const Properties nearest = {{"consumer.rescale", "nearest"}};
+    struct Case
+    {
+        int width, height, pattern;
+        const char *rect, *rotation;
+        bool distort;
+    } cases[] = {
+        {160, 90, 1, "20 10 80 45 1", nullptr, false},         // picture in picture
+        {160, 90, 2, "-30.5 12.25 200 120 1", nullptr, false}, // zoom from a fractional position
+        {160, 90, 1, "10 5 160 90 0.6", nullptr, false},       // moved only, with opacity
+        {120, 70, 3, "15 8 100 60 1", "25", false},            // rotation
+        {160, 90, 0, "0 0 160 90 1", "-90", false},            // quarter turn
+        {97, 61, 4, "5.5 3.5 120 70 0.8", "180", false},       // half turn
+        {160, 90, 1, "30 20 50 70 1", nullptr, true},          // distort
+        {160, 90, 2, "0% 10% 50% 50% 1", nullptr, false},      // percentages
+        {200, 100, 1, "-400 -200 960 540 1", "3", false},      // large zoom, slightly rotated
+        {40, 30, 3, "60.3 40.7 33.1 21.9 0.93", "-47", false}, // small
+    };
+    for (const Case &c : cases) {
+        Properties properties = {{"rect", c.rect}};
+        if (c.rotation) {
+            properties.push_back({"rotation", c.rotation});
+        }
+        if (c.distort) {
+            properties.push_back({"distort", "1"});
+        }
+        const Image input = makeImage(c.width, c.height, c.pattern);
+        for (const Properties *frameProperties : {&smooth, &nearest}) {
+            // The output has the profile size
+            expectSame(profile, {{"qtblend", properties}}, input, false, 0, *frameProperties, profile->width, profile->height);
+        }
+    }
+    const Image input = makeImage(160, 90, 1);
+    // Animated, rotation around the center or an anchor point
+    expectSame(profile, {{"qtblend", {{"rect", "0=0 0 160 90 1;10=40 20 80 45 0.5"}, {"rotation", "0=0;10=30"}, {"rotate_center", "1"}, {"out", "10"}}}}, input,
+               false, 4, smooth, 160, 90);
+    expectSame(profile, {{"qtblend", {{"rect", "10 10 100 60 1"}, {"rotation", "-15"}, {"rotate_anchor", "0.2 0.8"}}}}, input, false, 0, smooth, 160, 90);
+    // Two transforms: the lower one follows the consumer scaling set by the upper one
+    expectSame(profile, {{"qtblend", {{"rect", "10 10 120 70 1"}}}, {"qtblend", {{"rect", "-20 5 140 80 0.9"}, {"rotation", "12"}}}}, input, false, 0, smooth,
+               160, 90);
+    // Preview at half resolution: consumer scaling
+    expectSame(profile, {{"qtblend", {{"rect", "30 15 100 60 1"}, {"rotation", "8"}}}}, makeImage(80, 45, 2), false, 0, smooth, 80, 45);
+    // With a background color
+    expectSame(profile, {{"qtblend", {{"rect", "30 15 100 60 0.7"}, {"background_color", "0x80402010"}}}}, input, false, 0, smooth, 160, 90);
+
+    if (g_mock.active()) {
+        // Zoom with a shadow: one upload, one download (MLT 7.38 downscales on the CPU, hence the zoom)
+        g_mock.reset();
+        const std::vector<FilterSpec> chain = {{"qtblend", {{"rect", "-20 -10 200 112.5 1"}, {"rotation", "5"}}}, {"dropshadow", {{"radius", "4"}}}};
+        expectSame(profile, chain, input, false, 0, smooth, 160, 90);
+        g_mock.reset();
+        render(profile, chain, input, false, 0, smooth, 160, 90);
+        check(g_mock.stats().uploads == 2 && g_mock.stats().downloads == 1,
+              "transform and shadow: %llu uploads (the frame and the transform tables) and %llu downloads", (unsigned long long)g_mock.stats().uploads,
+              (unsigned long long)g_mock.stats().downloads);
+
+        // Left to the CPU: other composition modes, rotation with distortion
+        for (const Properties &properties :
+             std::vector<Properties>{{{"rect", "20 10 100 60 1"}, {"compositing", "13"}}, {{"rect", "20 10 100 30 1"}, {"distort", "1"}, {"rotation", "20"}}}) {
+            g_mock.reset();
+            expectSame(profile, {{"qtblend", properties}}, input, false, 0, smooth, 160, 90);
+            check(g_mock.stats().launches == 0, "%s ran on the GPU", describe({{"qtblend", properties}}).c_str());
+        }
     }
 }
 
@@ -672,6 +760,7 @@ int main(int argc, char **argv)
     testRectBlur(profile);
     testColor(profile);
     testFrei0r(profile);
+    testTransform(profile);
     testChains(profile);
     testProducer(profile);
     testGlobalSwitch(profile);

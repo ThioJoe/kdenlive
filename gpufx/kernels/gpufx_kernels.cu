@@ -610,3 +610,341 @@ GPUFX_KERNEL void gpufx_unsharp_v(const gpufx_u32 *__restrict__ sums, const gpuf
     }
     dst[index] = gpufx_pack(c[0], c[1], c[2], p >> 24);
 }
+
+/* ==========================================================================
+ * QPainter::drawImage() with a transform onto an RGBA8888 image, as used by
+ * MLT's "qtblend" filter (Kdenlive's Transform). The host ports Qt's
+ * rasterizer and passes, for every destination row, the spans with their
+ * coverage and the runs that Qt fetches, blends and stores in one call (see
+ * gpufx/src/qt_raster.cpp). Each thread then redoes for its pixel what Qt's
+ * 16-bit pipeline does, including the groups of 4 pixels its SSE4 format
+ * conversions work on: every thread computes the whole group of its pixel.
+ *
+ * rows: per destination row, first span, span count, first run, run count
+ * spans: x, length, coverage
+ * runs: x, length, then the source position of the first pixel: 16.16 fixed
+ *       point for the transformed modes, integer pixel for untransformed
+ * ========================================================================== */
+
+#define GPUFX_QT_UNTRANSFORMED 0
+#define GPUFX_QT_NEAREST 1
+#define GPUFX_QT_BILINEAR 2
+
+GPUFX_DEV GpufxRgba64 gpufx_qt_expand(gpufx_u32 p)
+{
+    GpufxRgba64 v;
+    v.r = (p & 0xffu) * 257u;
+    v.g = ((p >> 8) & 0xffu) * 257u;
+    v.b = ((p >> 16) & 0xffu) * 257u;
+    v.a = (p >> 24) * 257u;
+    return v;
+}
+
+// QRgba64::fromArgb32().premultiplied(): the scalar tail of the conversions
+GPUFX_DEV GpufxRgba64 gpufx_qt_premultiply_exact(gpufx_u32 p)
+{
+    GpufxRgba64 v = gpufx_qt_expand(p);
+    if (v.a == 65535u) {
+        return v;
+    }
+    if (v.a == 0) {
+        v.r = v.g = v.b = 0;
+        return v;
+    }
+    v.r = gpufx_div65535(v.r * v.a);
+    v.g = gpufx_div65535(v.g * v.a);
+    v.b = gpufx_div65535(v.b * v.a);
+    return v;
+}
+
+// convertARGBToRGBA64PM_sse4 on a group that is neither all transparent nor all opaque
+GPUFX_DEV GpufxRgba64 gpufx_qt_premultiply_simd(gpufx_u32 p)
+{
+    GpufxRgba64 v = gpufx_qt_expand(p);
+    gpufx_u32 x = (v.r * v.a) >> 16;
+    v.r = x + (x >> 15);
+    x = (v.g * v.a) >> 16;
+    v.g = x + (x >> 15);
+    x = (v.b * v.a) >> 16;
+    v.b = x + (x >> 15);
+    return v;
+}
+
+/* Converts 4 RGBA8888 pixels to 16-bit premultiplied like
+ * convertARGBToRGBA64PM_sse4: a full group of 4 is converted at once, the
+ * pixels of a shorter group are the scalar tail of the call (entries past the
+ * tail are converted too, they are not used). */
+GPUFX_DEV void gpufx_qt_convert(const gpufx_u32 *p, GpufxRgba64 *out, bool full)
+{
+    const gpufx_u32 alphas = (p[0] >> 24) | (p[1] >> 24) | (p[2] >> 24) | (p[3] >> 24);
+    const gpufx_u32 opaque = (p[0] >> 24) & (p[1] >> 24) & (p[2] >> 24) & (p[3] >> 24);
+    GPUFX_UNROLL
+    for (int k = 0; k < 4; ++k) {
+        if (!full) {
+            out[k] = gpufx_qt_premultiply_exact(p[k]);
+        } else if (alphas == 0) {
+            out[k].r = out[k].g = out[k].b = out[k].a = 0;
+        } else if (opaque == 255u) {
+            out[k] = gpufx_qt_expand(p[k]);
+        } else {
+            out[k] = gpufx_qt_premultiply_simd(p[k]);
+        }
+    }
+}
+
+GPUFX_DEV gpufx_u32 gpufx_mulhi16(gpufx_u32 a, gpufx_u32 b)
+{
+    return (a * b) >> 16;
+}
+
+/* interpolate_4_pixels_rgb64() (SSE2), 16-bit weights */
+GPUFX_DEV GpufxRgba64 gpufx_qt_interpolate(GpufxRgba64 tl, GpufxRgba64 tr, GpufxRgba64 bl, GpufxRgba64 br, gpufx_u32 distx, gpufx_u32 disty)
+{
+    if (disty) {
+        const gpufx_u32 idy = 0x10000u - disty;
+        tl.r = (gpufx_mulhi16(tl.r, idy) + gpufx_mulhi16(bl.r, disty)) & 0xffffu;
+        tl.g = (gpufx_mulhi16(tl.g, idy) + gpufx_mulhi16(bl.g, disty)) & 0xffffu;
+        tl.b = (gpufx_mulhi16(tl.b, idy) + gpufx_mulhi16(bl.b, disty)) & 0xffffu;
+        tl.a = (gpufx_mulhi16(tl.a, idy) + gpufx_mulhi16(bl.a, disty)) & 0xffffu;
+        tr.r = (gpufx_mulhi16(tr.r, idy) + gpufx_mulhi16(br.r, disty)) & 0xffffu;
+        tr.g = (gpufx_mulhi16(tr.g, idy) + gpufx_mulhi16(br.g, disty)) & 0xffffu;
+        tr.b = (gpufx_mulhi16(tr.b, idy) + gpufx_mulhi16(br.b, disty)) & 0xffffu;
+        tr.a = (gpufx_mulhi16(tr.a, idy) + gpufx_mulhi16(br.a, disty)) & 0xffffu;
+    }
+    if (distx) {
+        const gpufx_u32 idx = 0x10000u - distx;
+        tl.r = (gpufx_mulhi16(tl.r, idx) + gpufx_mulhi16(tr.r, distx)) & 0xffffu;
+        tl.g = (gpufx_mulhi16(tl.g, idx) + gpufx_mulhi16(tr.g, distx)) & 0xffffu;
+        tl.b = (gpufx_mulhi16(tl.b, idx) + gpufx_mulhi16(tr.b, distx)) & 0xffffu;
+        tl.a = (gpufx_mulhi16(tl.a, idx) + gpufx_mulhi16(tr.a, distx)) & 0xffffu;
+    }
+    return tl;
+}
+
+GPUFX_DEV GpufxRgba64 gpufx_qt_multiply(GpufxRgba64 v, gpufx_u32 a)
+{
+    v.r = gpufx_div65535(v.r * a);
+    v.g = gpufx_div65535(v.g * a);
+    v.b = gpufx_div65535(v.b * a);
+    v.a = gpufx_div65535(v.a * a);
+    return v;
+}
+
+/* comp_func_SourceOver_rgb64() with const_alpha = coverage * opacity */
+GPUFX_DEV GpufxRgba64 gpufx_qt_source_over(GpufxRgba64 s, GpufxRgba64 d, gpufx_u32 constAlpha)
+{
+    if (constAlpha == 255u) {
+        if (s.a == 65535u) {
+            return s;
+        }
+        if (s.a == 0) {
+            return d;
+        }
+    } else {
+        s = gpufx_qt_multiply(s, constAlpha * 257u);
+    }
+    const GpufxRgba64 m = gpufx_qt_multiply(d, 65535u - s.a);
+    s.r = (s.r + m.r) & 0xffffu;
+    s.g = (s.g + m.g) & 0xffffu;
+    s.b = (s.b + m.b) & 0xffffu;
+    s.a = (s.a + m.a) & 0xffffu;
+    return s;
+}
+
+// _mm_packus_epi32 then _mm_packus_epi16 of a rounded float
+GPUFX_DEV gpufx_u32 gpufx_qt_pack_float(float v)
+{
+    int i = gpufx_f2i_rn(v);
+    i = gpufx_clamp(i, 0, 65535);
+    if (i > 32767) {
+        return 0; // negative as a signed 16-bit value
+    }
+    return gpufx_u32(gpufx_min(i, 255));
+}
+
+/* convertARGBFromRGBA64PM_sse4<RGBA>: stores a group of 4 pixels, or a
+ * scalar tail of fewer pixels (qConvertRgba64ToRgb32_sse4). */
+GPUFX_DEV gpufx_u32 gpufx_qt_store(const GpufxRgba64 *v, int count, int k)
+{
+    // Constant indices keep the group in registers
+    const GpufxRgba64 p = k == 0 ? v[0] : (k == 1 ? v[1] : (k == 2 ? v[2] : v[3]));
+    if (count < 4) {
+        if (p.a == 0) {
+            return 0;
+        }
+        gpufx_u32 r = p.r;
+        gpufx_u32 g = p.g;
+        gpufx_u32 b = p.b;
+        if (p.a != 65535u) {
+            const float via = gpufx_fdiv_rn(65535.0f, gpufx_i2f_rn(int(p.a)));
+            r = gpufx_u32(gpufx_clamp(gpufx_f2i_rn(gpufx_fmul_rn(gpufx_i2f_rn(int(r)), via)), 0, 65535));
+            g = gpufx_u32(gpufx_clamp(gpufx_f2i_rn(gpufx_fmul_rn(gpufx_i2f_rn(int(g)), via)), 0, 65535));
+            b = gpufx_u32(gpufx_clamp(gpufx_f2i_rn(gpufx_fmul_rn(gpufx_i2f_rn(int(b)), via)), 0, 65535));
+        }
+        return gpufx_pack(gpufx_div257(r), gpufx_div257(g), gpufx_div257(b), gpufx_div257(p.a));
+    }
+    const bool transparent = (v[0].a | v[1].a | v[2].a | v[3].a) == 0;
+    const bool opaque = (v[0].a & v[1].a & v[2].a & v[3].a) == 65535u;
+    if (transparent) {
+        return 0;
+    }
+    if (opaque) {
+        return gpufx_pack(gpufx_div257(p.r), gpufx_div257(p.g), gpufx_div257(p.b), gpufx_div257(p.a));
+    }
+    if (p.a == 0) {
+        return 0;
+    }
+    const float ia = gpufx_fdiv_rn(255.0f, gpufx_i2f_rn(int(p.a)));
+    return gpufx_pack(gpufx_qt_pack_float(gpufx_fmul_rn(gpufx_i2f_rn(int(p.r)), ia)), gpufx_qt_pack_float(gpufx_fmul_rn(gpufx_i2f_rn(int(p.g)), ia)),
+                      gpufx_qt_pack_float(gpufx_fmul_rn(gpufx_i2f_rn(int(p.b)), ia)), gpufx_div257(p.a));
+}
+
+GPUFX_DEV gpufx_u32 gpufx_qt_coverage(const int *__restrict__ spans, int first, int count, int x)
+{
+    int lo = 0;
+    int hi = count - 1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) >> 1;
+        const int *s = spans + 3 * (first + mid);
+        if (x < s[0]) {
+            hi = mid - 1;
+        } else if (x >= s[0] + s[1]) {
+            lo = mid + 1;
+        } else {
+            return gpufx_u32(s[2]);
+        }
+    }
+    return 0;
+}
+
+// fetchTransformedBilinear_pixelBounds<BlendTransformedBilinear>
+GPUFX_DEV void gpufx_qt_bounds(int max, int &v1, int &v2)
+{
+    if (v1 < 0) {
+        v2 = v1 = 0;
+    } else if (v1 >= max) {
+        v2 = v1 = max;
+    } else {
+        v2 = v1 + 1;
+    }
+}
+
+GPUFX_KERNEL void gpufx_qt_draw_image(const gpufx_u32 *__restrict__ src, int sw, int sh, gpufx_u32 *__restrict__ dst, int dw, int dh,
+                                      const int *__restrict__ rows, const int *__restrict__ spans, const int *__restrict__ runs, int mode, int fdx, int fdy,
+                                      int opacity, gpufx_u32 background)
+{
+    const int x = GPUFX_GLOBAL_X;
+    const int y = GPUFX_GLOBAL_Y;
+    if (x >= dw || y >= dh) {
+        return;
+    }
+    const int *row = rows + 4 * y;
+    const int *run = 0;
+    for (int r = 0; r < row[3]; ++r) {
+        const int *candidate = runs + 4 * (row[2] + r);
+        if (x >= candidate[0] && x < candidate[0] + candidate[1]) {
+            run = candidate;
+            break;
+        }
+    }
+    const size_t index = size_t(y) * size_t(dw) + size_t(x);
+    if (!run) {
+        dst[index] = background;
+        return;
+    }
+    const int start = run[0];
+    const int length = run[1];
+    const int i = x - start;
+    const int group = i & ~3;
+    const int count = gpufx_min(4, length - group);
+
+    // Source pixels of the group in 16-bit premultiplied. Entries past the end
+    // of the run repeat its last pixel and are not used.
+    GpufxRgba64 source[4];
+    if (mode == GPUFX_QT_BILINEAR) {
+        gpufx_u32 tl[4];
+        gpufx_u32 tr[4];
+        gpufx_u32 bl[4];
+        gpufx_u32 br[4];
+        gpufx_u32 distx[4];
+        gpufx_u32 disty[4];
+        GPUFX_UNROLL
+        for (int k = 0; k < 4; ++k) {
+            const int j = gpufx_min(group + k, length - 1);
+            // Qt adds fdx for every pixel of the run, the host checked that it stays in range
+            const int fx = int(gpufx_i64(run[2]) + gpufx_i64(j) * fdx);
+            const int fy = int(gpufx_i64(run[3]) + gpufx_i64(j) * fdy);
+            int x1 = fx >> 16;
+            int x2;
+            int y1 = fy >> 16;
+            int y2;
+            gpufx_qt_bounds(sw - 1, x1, x2);
+            gpufx_qt_bounds(sh - 1, y1, y2);
+            const gpufx_u32 *s1 = src + size_t(y1) * size_t(sw);
+            const gpufx_u32 *s2 = src + size_t(y2) * size_t(sw);
+            tl[k] = s1[x1];
+            tr[k] = s1[x2];
+            bl[k] = s2[x1];
+            br[k] = s2[x2];
+            distx[k] = gpufx_u32(fx) & 0xffffu;
+            disty[k] = gpufx_u32(fy) & 0xffffu;
+        }
+        // Qt converts the left and right texels of two output pixels as one group of 4
+        GpufxRgba64 ctl[4];
+        GpufxRgba64 ctr[4];
+        GpufxRgba64 cbl[4];
+        GpufxRgba64 cbr[4];
+        GPUFX_UNROLL
+        for (int k = 0; k < 4; k += 2) {
+            const bool full = count - k >= 2;
+            const gpufx_u32 top[4] = {tl[k], tr[k], tl[k + 1], tr[k + 1]};
+            const gpufx_u32 bottom[4] = {bl[k], br[k], bl[k + 1], br[k + 1]};
+            GpufxRgba64 ct[4];
+            GpufxRgba64 cb[4];
+            gpufx_qt_convert(top, ct, full);
+            gpufx_qt_convert(bottom, cb, full);
+            ctl[k] = ct[0];
+            ctr[k] = ct[1];
+            ctl[k + 1] = ct[2];
+            ctr[k + 1] = ct[3];
+            cbl[k] = cb[0];
+            cbr[k] = cb[1];
+            cbl[k + 1] = cb[2];
+            cbr[k + 1] = cb[3];
+        }
+        GPUFX_UNROLL
+        for (int k = 0; k < 4; ++k) {
+            source[k] = gpufx_qt_interpolate(ctl[k], ctr[k], cbl[k], cbr[k], distx[k], disty[k]);
+        }
+    } else {
+        gpufx_u32 texels[4];
+        GPUFX_UNROLL
+        for (int k = 0; k < 4; ++k) {
+            const int j = gpufx_min(group + k, length - 1);
+            int px;
+            int py;
+            if (mode == GPUFX_QT_NEAREST) {
+                px = gpufx_clamp(int(gpufx_i64(run[2]) + gpufx_i64(j) * fdx) >> 16, 0, sw - 1);
+                py = gpufx_clamp(int(gpufx_i64(run[3]) + gpufx_i64(j) * fdy) >> 16, 0, sh - 1);
+            } else {
+                px = run[2] + j;
+                py = run[3];
+            }
+            texels[k] = src[size_t(py) * size_t(sw) + size_t(px)];
+        }
+        gpufx_qt_convert(texels, source, count == 4);
+    }
+
+    // The destination still holds the background
+    const gpufx_u32 backgrounds[4] = {background, background, background, background};
+    GpufxRgba64 dest[4];
+    gpufx_qt_convert(backgrounds, dest, count == 4);
+
+    GpufxRgba64 blended[4];
+    GPUFX_UNROLL
+    for (int k = 0; k < 4; ++k) {
+        const gpufx_u32 coverage = gpufx_qt_coverage(spans, row[0], row[1], start + gpufx_min(group + k, length - 1));
+        blended[k] = gpufx_qt_source_over(source[k], dest[k], (coverage * gpufx_u32(opacity)) >> 8);
+    }
+    dst[index] = gpufx_qt_store(blended, count, i - group);
+}

@@ -27,6 +27,7 @@ installed in MLT's module directory.
 | Glow                                | `frei0r.glow`       | Identical output |
 | Soft Glow                           | `frei0r.softglow`   | Identical output |
 | Sharpen                             | `frei0r.sharpness`  | Identical output |
+| Transform                           | `qtblend`           | Matches the CPU filter (QPainter): same alpha, colors within one level. Alpha blend compositing and 8-bit only, see below |
 
 Any mix of accelerated and CPU-only effects works: each accelerated effect is
 moved to the GPU for its own processing, and the others stay on the CPU.
@@ -47,6 +48,22 @@ they stay on the CPU when their MLT `threads` property splits the frame in
 slices. An error that leaves the GPU in an unknown state turns GPU processing
 off for the rest of the session.
 
+### Transform
+
+The Transform effect (MLT's `qtblend`) draws the clip with QPainter. The GPU
+version reproduces Qt's raster engine: the transform with its rounding, the
+antialiased edges (Qt's rasterizer is ported in `src/qt_raster.cpp`), the
+16-bit bilinear sampling and blending, and the conversions back to 8 bits.
+The only difference left comes from the approximate reciprocal that Qt uses
+to un-premultiply colors (an SSE instruction whose exact results vary between
+processors): some colors can differ by one level.
+
+These cases stay on the CPU: composition modes other than *Alpha blend*,
+rotation combined with *Distort*, and with MLT 7.38, scaling a clip down
+(that version scales with `QImage::scaled()`). The geometry follows MLT 7.38
+to 7.44; with a newer MLT the effect stays on the CPU until the module is
+updated, unless `MLT_GPUFX_QTBLEND=force` is set.
+
 ## Requirements
 
 * An NVIDIA GPU of the Maxwell generation or newer (compute capability 5.0)
@@ -65,13 +82,14 @@ immediately and is passed to the render processes.
 
 Outside Kdenlive the module is controlled with environment variables:
 
-| Variable              | Effect |
-|-----------------------|--------|
-| `MLT_GPUFX=0`         | Do not touch any filter |
-| `MLT_GPUFX_DISABLE`   | Comma separated MLT services to keep on the CPU, e.g. `dropshadow,box_blur` |
-| `MLT_GPUFX_DEBUG=1`   | Log every frame processed on the GPU (MLT info log level) |
-| `GPUFX_CUDA_DEVICE=n` | Use the n-th CUDA device (default 0) |
-| `GPUFX_POOL_MB=n`     | Size of the GPU memory kept for reuse (default: 1/8 of the GPU memory, at most 1 GiB) |
+| Variable                  | Effect |
+|---------------------------|--------|
+| `MLT_GPUFX=0`             | Do not touch any filter |
+| `MLT_GPUFX_DISABLE`       | Comma separated MLT services to keep on the CPU, e.g. `dropshadow,box_blur` |
+| `MLT_GPUFX_DEBUG=1`       | Log every frame processed on the GPU (MLT info log level) |
+| `MLT_GPUFX_QTBLEND=force` | Accelerate Transform with MLT versions newer than the module knows |
+| `GPUFX_CUDA_DEVICE=n`     | Use the n-th CUDA device (default 0) |
+| `GPUFX_POOL_MB=n`         | Size of the GPU memory kept for reuse (default: 1/8 of the GPU memory, at most 1 GiB) |
 
 Applications linking MLT can also set the MLT global property
 `gpufx.enabled` to `0` or `1` at any time. Creating the `gpufx` filter
@@ -131,7 +149,8 @@ set GPUFX_CUDA_LIBRARY=nvcuda.dll & gpufx_test.exe  # Windows
 * `src/gpu_runtime.cpp` loads the CUDA driver at runtime, creates the
   context, loads the PTX and keeps pools of GPU memory and streams.
 * `src/effect_*.cpp` read the parameters of each effect, exactly like the CPU
-  filter does, and launch the kernels.
+  filter does, and launch the kernels. `src/qt_raster.cpp` holds the parts of
+  Qt's paint engine needed to draw like QPainter.
 * `kernels/gpufx_kernels.cu` contains the kernels. They reproduce the integer
   arithmetic of the CPU code (for the drop shadow, Qt's blur, scaling and
   compositing), which is why the output matches.

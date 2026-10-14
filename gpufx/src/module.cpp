@@ -239,9 +239,9 @@ bool effectEnabled(const EffectDescriptor &effect)
 
 const std::vector<const EffectDescriptor *> &effectRegistry()
 {
-    static const std::vector<const EffectDescriptor *> effects = {&dropShadowEffect(), &boxBlurEffect(),        &rectBlurEffect(),
-                                                                  &brightnessEffect(), &liftGammaGainEffect(),  &frei0rSquareBlurEffect(),
-                                                                  &frei0rGlowEffect(), &frei0rSoftGlowEffect(), &frei0rSharpnessEffect()};
+    static const std::vector<const EffectDescriptor *> effects = {
+        &dropShadowEffect(),       &boxBlurEffect(),    &rectBlurEffect(),       &brightnessEffect(),      &liftGammaGainEffect(),
+        &frei0rSquareBlurEffect(), &frei0rGlowEffect(), &frei0rSoftGlowEffect(), &frei0rSharpnessEffect(), &transformEffect()};
     return effects;
 }
 

@@ -22,9 +22,11 @@ typedef unsigned char gpufx_u8;
 typedef unsigned short gpufx_u16;
 typedef unsigned int gpufx_u32;
 typedef unsigned long long gpufx_u64;
+typedef long long gpufx_i64;
 
 #define GPUFX_KERNEL extern "C" __global__
 #define GPUFX_DEV static __device__ __forceinline__
+#define GPUFX_UNROLL _Pragma("unroll")
 
 GPUFX_DEV int gpufx_f2i_rn(float x)
 {
@@ -56,6 +58,7 @@ typedef uint8_t gpufx_u8;
 typedef uint16_t gpufx_u16;
 typedef uint32_t gpufx_u32;
 typedef uint64_t gpufx_u64;
+typedef int64_t gpufx_i64;
 
 struct GpufxDim3
 {
@@ -72,6 +75,7 @@ extern thread_local GpufxDim3 gridDim;
 
 #define GPUFX_KERNEL extern "C"
 #define GPUFX_DEV static inline
+#define GPUFX_UNROLL
 
 GPUFX_DEV int gpufx_f2i_rn(float x)
 {
