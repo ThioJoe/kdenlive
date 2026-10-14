@@ -512,8 +512,9 @@ TransitionPlan planComposite(const TransitionContext &ctx)
         return TransitionPlan::cpu();
     }
     // Copying images to the GPU and back costs about as much as compositing
-    // them on the CPU: only worth it when an image is on the GPU anyway
-    if (!ctx.topOnGpu && !ctx.bottomOnGpu && !ctx.callerOnGpu) {
+    // them on the CPU: only worth it when an image is on the GPU anyway, or
+    // when the GPU also saves the conversion of the result
+    if (!ctx.topOnGpu && !ctx.bottomOnGpu && !ctx.callerOnGpu && !ctx.convertsOnGpu) {
         return TransitionPlan::cpu();
     }
     mlt_image_format format = ctx.format;

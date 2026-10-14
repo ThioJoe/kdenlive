@@ -127,6 +127,9 @@ struct TransitionContext
     bool topOnGpu = false;
     bool bottomOnGpu = false;
     bool callerOnGpu = false;
+    // Whether a result computed on the GPU would also be converted to the
+    // caller's format there (see deliversYuv422() in bridge.cpp)
+    bool convertsOnGpu = false;
 };
 
 /** The GPU work of a transition for one frame. */

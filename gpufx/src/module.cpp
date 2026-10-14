@@ -12,11 +12,16 @@
  * service names and parameters, and render the same with or without the
  * module, with or without an NVIDIA GPU.
  *
+ * It also takes over two image conversions MLT does with libswscale: the
+ * decoded 4:2:0 YUV video of avformat producers to RGBA, and RGBA results to
+ * the packed 4:2:2 YUV that consumers ask for (MLT's avcolour_space).
+ *
  * Runtime switches:
  *  - environment MLT_GPUFX=0: do not touch any filter
  *  - MLT global property "gpufx.enabled" (0/1): turns GPU processing off/on
  *    at runtime, overrides MLT_GPUFX
  *  - MLT_GPUFX_DISABLE=dropshadow,box_blur: keep these effects on the CPU
+ *    (avformat and avcolor_space stand for the two conversions)
  *  - MLT_GPUFX_DEBUG=1: log every frame processed on the GPU
  *  - GPUFX_CUDA_DEVICE=n: use the n-th CUDA device
  *
@@ -126,6 +131,33 @@ void onTransitionCreated(mlt_properties, void *, mlt_event_data eventData)
     }
 }
 
+void onProducerCreated(mlt_properties, void *, mlt_event_data eventData)
+{
+    auto *data = static_cast<mlt_factory_event_data *>(mlt_event_data_to_object(eventData));
+    if (!data || !data->name || !data->service) {
+        return;
+    }
+    mlt_producer producer = *static_cast<mlt_producer *>(data->service);
+    if (producer && (!strcmp(data->name, "avformat") || !strcmp(data->name, "avformat-novalidate"))) {
+        wrapProducer(producer);
+    }
+}
+
+std::string conversionList()
+{
+    std::string list;
+    for (const char *service : {"avformat", "avcolor_space"}) {
+        if (!serviceEnabled(service)) {
+            continue;
+        }
+        if (!list.empty()) {
+            list += ',';
+        }
+        list += service;
+    }
+    return list;
+}
+
 std::string transitionList()
 {
     std::string list;
@@ -184,6 +216,7 @@ void *statusServiceInit(mlt_profile, mlt_service_type, const char *, const void 
     mlt_properties_set_int(properties, "memory_mb", int(device.totalMemory >> 20));
     mlt_properties_set(properties, "effects", effectList().c_str());
     mlt_properties_set(properties, "transitions", transitionList().c_str());
+    mlt_properties_set(properties, "conversions", conversionList().c_str());
     mlt_properties_set_int64(properties, "gpu_frames", int64_t(runtime.gpuFrames()));
     mlt_properties_set_int64(properties, "cpu_frames", int64_t(runtime.cpuFrames()));
     return filter;
@@ -331,5 +364,6 @@ void mlt_register(mlt_repository repository)
     pinModule();
     mlt_events_listen(mlt_factory_event_object(), nullptr, "filter-create-done", onFilterCreated);
     mlt_events_listen(mlt_factory_event_object(), nullptr, "transition-create-done", onTransitionCreated);
+    mlt_events_listen(mlt_factory_event_object(), nullptr, "producer-create-done", onProducerCreated);
 }
 }

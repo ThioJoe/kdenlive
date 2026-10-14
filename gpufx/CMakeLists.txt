@@ -63,6 +63,7 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/gpufx_ptx.cpp"
 
 add_library(mltgpufx MODULE
     src/bridge.cpp
+    src/convert.cpp
     src/cuda_driver.cpp
     src/effect_blur.cpp
     src/effect_color.cpp
@@ -73,6 +74,7 @@ add_library(mltgpufx MODULE
     src/module.cpp
     src/qt_draw.cpp
     src/qt_raster.cpp
+    src/sws_port.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/gpufx_ptx.cpp"
 )
 target_link_libraries(mltgpufx PRIVATE Mlt7::mlt ${CMAKE_DL_LIBS})

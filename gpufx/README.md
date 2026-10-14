@@ -29,6 +29,8 @@ installed in MLT's module directory.
 | Sharpen                             | `frei0r.sharpness`   | Identical output |
 | Transform                           | `qtblend`            | Matches the CPU filter (QPainter): same alpha, colors within one level. Alpha blend compositing and 8-bit only, see below |
 | Track compositing                   | `qtblend` transition | Matches the CPU transition: same alpha, colors within one level, see below |
+| Video decoding to RGBA              | `avformat` producer  | Identical output, 8-bit 4:2:0 video, see below |
+| Output conversion to YUV            | `avcolor_space`      | Identical output, see below |
 
 Any mix of accelerated and CPU-only effects works: each accelerated effect is
 moved to the GPU for its own processing, and the others stay on the CPU.
@@ -75,13 +77,45 @@ top track without transparency replaces the tracks below without blending
 
 Copying both images to the GPU and the result back costs about as much as
 compositing them on the CPU, so a transition only runs on the GPU when one of
-its images is already there: a clip with accelerated effects, or the result
-of the transition below. With two composited tracks or more, the whole stack
-is drawn on the GPU: every clip image is uploaded once and the final frame is
-downloaded once.
+its images is already there (a clip with accelerated effects, or the result
+of the transition below), or when the GPU can also convert the result to the
+format the caller asks for (see below). With two composited tracks or more,
+the whole stack is drawn on the GPU: every clip image is uploaded once and
+the final frame is downloaded once.
 
 The same cases as for Transform stay on the CPU (blend modes, 10-bit,
 rotation with *Distort*, scaling down with MLT 7.38).
+
+### Image conversions
+
+Effects and compositing work on RGBA images, while video is decoded as YUV
+and encoded as YUV. MLT converts between them on the CPU with libswscale,
+which takes more time than most effects: measured on one core of an x86-64
+server processor, about 30 ms for a 1080p frame from YUV to RGBA, and 10 ms
+back to YUV.
+
+* **Video decoding to RGBA**: MLT's avformat producer converts every decoded
+  frame to the format asked for. gpufx wraps the avformat producers: when
+  RGBA is asked for and the video is 8-bit 4:2:0 YUV (`yuv420p`,
+  `yuvj420p`, `yuva420p`, the format of nearly all H.264, HEVC and VP9
+  video), it takes the frame as decoded, uploads it (1.5 bytes per pixel
+  instead of 4) and converts it on the GPU. When the next stage is an
+  accelerated effect, the RGBA image stays on the GPU. Other formats, odd
+  sizes, interlaced frames whose height is not a multiple of 4, and hardware
+  decoding (`hwaccel`) keep the CPU conversion.
+* **Output conversion to YUV**: MLT's avformat consumer (rendering to
+  `yuv420p` codecs) and Kdenlive's monitor ask for packed YUV 4:2:2. When the
+  final effect or compositing ran on the GPU and MLT would convert with its
+  `avcolor_space` filter, the GPU converts the result and only the YUV image
+  (and its alpha channel) is downloaded. This also lets compositing and
+  lightweight effects run on the GPU when nothing else of the frame is there.
+
+Both conversions reproduce libswscale with the flags MLT uses: the
+coefficients, chroma sampling positions and rounding are ported in
+`src/sws_port.cpp`, and the output is identical for every colorspace MLT
+handles (BT.601, BT.709, BT.2020, SMPTE 240M), limited and full range, and
+MLT's field by field conversion of interlaced video. These parts of
+libswscale are the same in FFmpeg 6.1, 7.1 and 8.0.
 
 ## Requirements
 
@@ -104,7 +138,7 @@ Outside Kdenlive the module is controlled with environment variables:
 | Variable                  | Effect |
 |---------------------------|--------|
 | `MLT_GPUFX=0`             | Do not touch any filter |
-| `MLT_GPUFX_DISABLE`       | Comma separated MLT services to keep on the CPU, e.g. `dropshadow,box_blur` |
+| `MLT_GPUFX_DISABLE`       | Comma separated MLT services to keep on the CPU, e.g. `dropshadow,box_blur`. `avformat` and `avcolor_space` stand for the two image conversions |
 | `MLT_GPUFX_DEBUG=1`       | Log every frame processed on the GPU (MLT info log level) |
 | `MLT_GPUFX_QTBLEND=force` | Accelerate Transform with MLT versions newer than the module knows |
 | `GPUFX_CUDA_DEVICE=n`     | Use the n-th CUDA device (default 0) |
@@ -141,7 +175,8 @@ build.
 
 `tests/gpufx_test` renders every accelerated effect, alone and in chains, once
 with the original CPU filter and once through the GPU path, and compares the
-pixels. It also checks the number of transfers between memory and GPU, the
+pixels. The conversions are compared on video files the test writes
+(YUV4MPEG2, decoded by MLT's avformat producer). It also checks the number of transfers between memory and GPU, the
 fallbacks on errors, and the behaviour without a GPU.
 
 By default the tests run against `mockcuda`, an emulated CUDA driver built
@@ -157,7 +192,8 @@ set GPUFX_CUDA_LIBRARY=nvcuda.dll & gpufx_test.exe  # Windows
 ## How it works
 
 * `src/module.cpp` registers the module. It listens to MLT's
-  `filter-create-done` factory event and wraps the filters it knows.
+  `filter-create-done`, `transition-create-done` and `producer-create-done`
+  factory events and wraps the filters, transitions and producers it knows.
 * `src/bridge.cpp` replaces the wrapped filter's `process()`: the original
   function still runs and pushes the CPU `get_image` on the frame, and the
   bridge slides its own `get_image` on top of it. For each frame the bridge
@@ -170,6 +206,8 @@ set GPUFX_CUDA_LIBRARY=nvcuda.dll & gpufx_test.exe  # Windows
 * `src/effect_*.cpp` read the parameters of each effect, exactly like the CPU
   filter does, and launch the kernels. `src/qt_raster.cpp` holds the parts of
   Qt's paint engine needed to draw like QPainter.
+* `src/convert.cpp` runs the image conversions, with the libswscale setup
+  ported in `src/sws_port.cpp`.
 * `kernels/gpufx_kernels.cu` contains the kernels. They reproduce the integer
   arithmetic of the CPU code (for the drop shadow, Qt's blur, scaling and
   compositing), which is why the output matches.

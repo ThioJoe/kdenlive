@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
@@ -579,10 +580,20 @@ int patternGetFrame(mlt_producer producer, mlt_frame_ptr frame, int)
     return 0;
 }
 
+void patternClose(mlt_producer producer)
+{
+    // mlt_producer_close() only frees producers created by mlt_producer_new() through this
+    producer->close = nullptr;
+    mlt_producer_close(producer);
+    free(producer);
+}
+
 mlt_producer patternProducer(mlt_profile profile, const Image *pattern)
 {
     mlt_producer producer = mlt_producer_new(profile);
     producer->get_frame = patternGetFrame;
+    producer->close = reinterpret_cast<mlt_destructor>(patternClose);
+    producer->close_object = producer;
     mlt_properties_set_data(MLT_PRODUCER_PROPERTIES(producer), "_pattern", const_cast<Image *>(pattern), 0, nullptr, nullptr);
     mlt_properties_set_position(MLT_PRODUCER_PROPERTIES(producer), "length", 100);
     mlt_properties_set_position(MLT_PRODUCER_PROPERTIES(producer), "out", 99);
@@ -827,6 +838,330 @@ void testProducer(mlt_profile profile)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Format conversions
+ * ------------------------------------------------------------------------- */
+
+/** An image returned by mlt_frame_get_image(), with what the format
+ *  conversions leave on the frame. */
+struct Output
+{
+    int width = 0;
+    int height = 0;
+    int format = mlt_image_none;
+    std::vector<uint8_t> data;
+    std::vector<uint8_t> alpha;
+    int colorspace = 0;
+    int fullRange = 0;
+};
+
+Output fetchOutput(mlt_frame frame, mlt_image_format format, int width, int height)
+{
+    Output output;
+    uint8_t *image = nullptr;
+    if (mlt_frame_get_image(frame, &image, &format, &width, &height, 0) || !image) {
+        fprintf(stderr, "get_image failed, format %d\n", int(format));
+        return output;
+    }
+    output.width = width;
+    output.height = height;
+    output.format = format;
+    const size_t pixels = size_t(width) * size_t(height);
+    output.data.assign(image, image + pixels * (format == mlt_image_rgba ? 4 : format == mlt_image_yuv422 ? 2 : 0));
+    int alphaSize = 0;
+    uint8_t *alpha = mlt_frame_get_alpha_size(frame, &alphaSize);
+    if (alpha && size_t(alphaSize) >= pixels) {
+        output.alpha.assign(alpha, alpha + pixels);
+    }
+    output.colorspace = mlt_properties_get_int(MLT_FRAME_PROPERTIES(frame), "colorspace");
+    output.fullRange = mlt_properties_get_int(MLT_FRAME_PROPERTIES(frame), "full_range");
+    return output;
+}
+
+/** tolerance: largest difference allowed per byte, for results drawn the
+ *  way Qt does, whose un-premultiplication is approximate */
+void expectSameOutput(const Output &cpu, const Output &gpu, const std::string &what, int tolerance = 0)
+{
+    const bool sameShape = !cpu.data.empty() && cpu.format == gpu.format && cpu.width == gpu.width && cpu.height == gpu.height && cpu.data.size() == gpu.data.size();
+    check(sameShape, "%s: format %d %dx%d on the CPU, %d %dx%d on the GPU", what.c_str(), cpu.format, cpu.width, cpu.height, gpu.format, gpu.width, gpu.height);
+    if (!sameShape) {
+        return;
+    }
+    size_t differences = 0;
+    int maxDiff = 0;
+    for (size_t i = 0; i < cpu.data.size(); ++i) {
+        const int diff = std::abs(int(cpu.data[i]) - int(gpu.data[i]));
+        if (diff) {
+            ++differences;
+            maxDiff = std::max(maxDiff, diff);
+        }
+    }
+    check(maxDiff <= tolerance, "%s: %zu bytes differ (max %d)", what.c_str(), differences, maxDiff);
+    check(cpu.alpha == gpu.alpha, "%s: the alpha planes differ (%zu and %zu bytes)", what.c_str(), cpu.alpha.size(), gpu.alpha.size());
+    check(cpu.colorspace == gpu.colorspace && cpu.fullRange == gpu.fullRange, "%s: colorspace %d / %d, full range %d / %d", what.c_str(), cpu.colorspace,
+          gpu.colorspace, cpu.fullRange, gpu.fullRange);
+}
+
+/** Writes a YUV4MPEG2 file of frames with random 4:2:0 content, which the
+ *  avformat producer decodes as yuv420p. parameters holds stream parameters
+ *  such as the interlacing ("Ip", "It"). */
+bool writeY4m(const std::string &path, int width, int height, int frames, const char *parameters)
+{
+    FILE *file = fopen(path.c_str(), "wb");
+    if (!file) {
+        return false;
+    }
+    fprintf(file, "YUV4MPEG2 W%d H%d F25:1 A1:1 C420jpeg %s\n", width, height, parameters);
+    std::vector<uint8_t> data(size_t(width) * size_t(height) + 2 * size_t((width + 1) / 2) * size_t((height + 1) / 2));
+    uint32_t seed = uint32_t(width) * 7919u + uint32_t(height);
+    for (int i = 0; i < frames; ++i) {
+        for (uint8_t &value : data) {
+            seed = seed * 1664525u + 1013904223u;
+            value = uint8_t(seed >> 24);
+        }
+        fputs("FRAME\n", file);
+        fwrite(data.data(), 1, data.size(), file);
+    }
+    fclose(file);
+    return true;
+}
+
+std::string tempPath(const std::string &name)
+{
+    return (std::filesystem::temp_directory_path() / name).string();
+}
+
+/** The image of the avformat producer at position, with filters attached to
+ *  the producer. */
+Output decode(mlt_profile profile, const std::string &path, bool cpu, mlt_position position, const Properties &producerProperties,
+              const std::vector<FilterSpec> &specs = {})
+{
+    Output output;
+    mlt_producer producer = mlt_factory_producer(profile, "avformat", path.c_str());
+    if (!producer) {
+        fprintf(stderr, "cannot open %s\n", path.c_str());
+        return output;
+    }
+    mlt_properties properties = MLT_PRODUCER_PROPERTIES(producer);
+    mlt_properties_set_int(properties, "_gpufx.disable", cpu ? 1 : 0);
+    for (const auto &property : producerProperties) {
+        mlt_properties_set(properties, property.first, property.second.c_str());
+    }
+    std::vector<mlt_filter> filters = createFilters(profile, specs, cpu);
+    for (mlt_filter filter : filters) {
+        mlt_producer_attach(producer, filter);
+    }
+    mlt_producer_seek(producer, position);
+    mlt_frame frame = nullptr;
+    mlt_service_get_frame(MLT_PRODUCER_SERVICE(producer), &frame, 0);
+    if (frame) {
+        output = fetchOutput(frame, mlt_image_rgba, profile->width, profile->height);
+        mlt_frame_close(frame);
+    }
+    for (mlt_filter filter : filters) {
+        mlt_filter_close(filter);
+    }
+    mlt_producer_close(producer);
+    return output;
+}
+
+void testDecoding(mlt_profile profile)
+{
+    if (!mlt_properties_get_data(mlt_repository_producers(mlt_factory_repository()), "avformat", nullptr)) {
+        printf("SKIP: MLT has no avformat producer\n");
+        return;
+    }
+    struct Case
+    {
+        const char *name;
+        int width, height;
+        const char *parameters;
+        Properties producer;
+        bool onGpu;
+    };
+    const Case cases[] = {
+        {"720p", 1280, 720, "Ip", {}, true}, // BT.709 by default
+        {"pal", 720, 576, "Ip", {}, true},   // BT.601 by default
+        {"interlaced", 720, 576, "It", {}, true},
+        // The producer converts the fields of interlaced frames separately,
+        // which needs a height that is a multiple of 4 on the GPU
+        {"interlaced 486 lines", 720, 486, "Ib", {}, false},
+        {"full range", 640, 360, "Ip XCOLORRANGE=FULL", {}, true},
+        {"full range interlaced", 640, 360, "It XCOLORRANGE=FULL", {}, true},
+        {"odd width", 33, 20, "Ip", {}, false},
+        {"bt2020", 640, 360, "Ip", {{"force_colorspace", "2020"}}, true},
+        {"smpte240m", 640, 360, "Ip", {{"force_colorspace", "240"}}, true},
+        {"bt601 hd", 1280, 720, "Ip", {{"force_colorspace", "601"}}, true},
+        {"forced full range", 320, 180, "Ip", {{"force_full_range", "1"}}, true},
+    };
+    for (const Case &c : cases) {
+        const std::string path = tempPath(std::string("gpufx_test_") + std::to_string(c.width) + "x" + std::to_string(c.height) + ".y4m");
+        if (!writeY4m(path, c.width, c.height, 3, c.parameters)) {
+            check(false, "decoding: cannot write %s", path.c_str());
+            continue;
+        }
+        g_mock.reset();
+        const Output gpu = decode(profile, path, false, 1, c.producer);
+        const MockCudaStats stats = g_mock.stats();
+        const Output cpu = decode(profile, path, true, 1, c.producer);
+        expectSameOutput(cpu, gpu, std::string("decoding ") + c.name);
+        if (g_mock.active()) {
+            const uint64_t yuvBytes = uint64_t(c.width) * uint64_t(c.height) * 3 / 2;
+            if (c.onGpu) {
+                check(stats.launches == 1 && stats.uploadedBytes < yuvBytes + 16384 && stats.downloadedBytes == uint64_t(c.width) * uint64_t(c.height) * 4,
+                      "decoding %s: %llu launches, %llu bytes uploaded, %llu downloaded", c.name, (unsigned long long)stats.launches,
+                      (unsigned long long)stats.uploadedBytes, (unsigned long long)stats.downloadedBytes);
+            } else {
+                check(stats.launches == 0, "decoding %s: converted on the GPU", c.name);
+            }
+        }
+        remove(path.c_str());
+    }
+
+    // The decoded image goes straight into a GPU effect, the RGBA image only
+    // exists on the GPU between them
+    const std::string path = tempPath("gpufx_test_chain.y4m");
+    if (writeY4m(path, 320, 180, 2, "Ip")) {
+        const std::vector<FilterSpec> chain = {{"brightness", {{"level", "0.8"}}}, {"box_blur", {{"hradius", "5"}, {"vradius", "3"}}}};
+        if (hasFilters(chain)) {
+            g_mock.reset();
+            const Output gpu = decode(profile, path, false, 0, {}, chain);
+            const MockCudaStats stats = g_mock.stats();
+            const Output cpu = decode(profile, path, true, 0, {}, chain);
+            expectSameOutput(cpu, gpu, "decoding into GPU effects");
+            if (g_mock.active()) {
+                check(stats.downloads == 1 && stats.uploadedBytes < 320 * 180 * 2,
+                      "decoding into GPU effects: %llu uploads (%llu bytes), %llu downloads", (unsigned long long)stats.uploads,
+                      (unsigned long long)stats.uploadedBytes, (unsigned long long)stats.downloads);
+            }
+        }
+        remove(path.c_str());
+    }
+}
+
+/** Filters on a producer, whose image is requested in format. MLT's
+ *  avcolour_space converts it, as when the loader normalizes a producer. */
+Output renderFormat(mlt_profile profile, const std::vector<FilterSpec> &specs, const Image &input, bool cpu, mlt_image_format format,
+                    const Properties &frameProperties)
+{
+    Output output;
+    mlt_producer producer = patternProducer(profile, &input);
+    mlt_filter converter = mlt_factory_filter(profile, "avcolor_space", nullptr);
+    if (converter) {
+        mlt_producer_attach(producer, converter);
+    }
+    std::vector<mlt_filter> filters = createFilters(profile, specs, cpu);
+    for (mlt_filter filter : filters) {
+        mlt_producer_attach(producer, filter);
+    }
+    mlt_frame frame = nullptr;
+    mlt_service_get_frame(MLT_PRODUCER_SERVICE(producer), &frame, 0);
+    if (frame) {
+        for (const auto &property : frameProperties) {
+            mlt_properties_set(MLT_FRAME_PROPERTIES(frame), property.first, property.second.c_str());
+        }
+        output = fetchOutput(frame, format, input.width, input.height);
+        mlt_frame_close(frame);
+    }
+    for (mlt_filter filter : filters) {
+        mlt_filter_close(filter);
+    }
+    mlt_filter_close(converter);
+    mlt_producer_close(producer);
+    return output;
+}
+
+void testYuvOutput(mlt_profile profile)
+{
+    if (!hasFilter("avcolor_space") || !hasFilter("box_blur")) {
+        printf("SKIP: no avcolor_space or box_blur filter\n");
+        return;
+    }
+    const std::vector<FilterSpec> blur = {{"box_blur", {{"hradius", "6"}, {"vradius", "4"}}}};
+    const int colorspace = profile->colorspace;
+    struct Case
+    {
+        int width, height, pattern, colorspace;
+        Properties frame;
+        bool onGpu;
+    };
+    const Case cases[] = {
+        {160, 90, 1, 709, {}, true},
+        {160, 90, 2, 601, {}, true},
+        {96, 54, 3, 2020, {}, true},
+        {96, 54, 0, 240, {}, true},
+        {160, 90, 4, 709, {{"consumer.color_range", "full"}}, true},
+        {160, 90, 1, 601, {{"consumer.color_range", "pc"}}, true},
+        // Odd widths stay with the CPU conversion
+        {97, 54, 2, 709, {}, false},
+    };
+    for (const Case &c : cases) {
+        profile->colorspace = c.colorspace;
+        const Image input = makeImage(c.width, c.height, c.pattern);
+        g_mock.reset();
+        const Output gpu = renderFormat(profile, blur, input, false, mlt_image_yuv422, c.frame);
+        const MockCudaStats stats = g_mock.stats();
+        const Output cpu = renderFormat(profile, blur, input, true, mlt_image_yuv422, c.frame);
+        std::string what = "yuv422 output " + std::to_string(c.width) + "x" + std::to_string(c.height) + " colorspace " + std::to_string(c.colorspace);
+        for (const auto &property : c.frame) {
+            what += std::string(", ") + property.first + "=" + property.second;
+        }
+        expectSameOutput(cpu, gpu, what);
+        if (g_mock.active()) {
+            const uint64_t pixels = uint64_t(c.width) * uint64_t(c.height);
+            // YUV 4:2:2 and the alpha plane instead of RGBA
+            const uint64_t expected = c.onGpu ? pixels * 3 : pixels * 4;
+            check(stats.downloadedBytes == expected, "%s: %llu bytes downloaded, expected %llu", what.c_str(), (unsigned long long)stats.downloadedBytes,
+                  (unsigned long long)expected);
+        }
+    }
+    profile->colorspace = colorspace;
+
+    // From track compositing
+    if (hasFilter("qtblend") || mlt_properties_get_data(mlt_repository_transitions(mlt_factory_repository()), "qtblend", nullptr)) {
+        const Image bottom = makeImage(profile->width, profile->height, 1);
+        const Image top = makeImage(profile->width, profile->height, 3);
+        auto renderYuv = [&](bool cpu) {
+            Output output;
+            mlt_tractor tractor = mlt_tractor_new();
+            mlt_multitrack multitrack = mlt_tractor_multitrack(tractor);
+            mlt_field field = mlt_tractor_field(tractor);
+            mlt_producer producers[2] = {patternProducer(profile, &bottom), patternProducer(profile, &top)};
+            mlt_filter converter = mlt_factory_filter(profile, "avcolor_space", nullptr);
+            mlt_producer_attach(producers[0], converter);
+            mlt_multitrack_connect(multitrack, producers[0], 0);
+            mlt_multitrack_connect(multitrack, producers[1], 1);
+            mlt_transition transition = mlt_factory_transition(profile, "qtblend", nullptr);
+            mlt_properties_set_int(MLT_TRANSITION_PROPERTIES(transition), "always_active", 1);
+            // Moved and faded, without scaling, which MLT 7.38 does with QImage::scaled() on the CPU
+            mlt_properties_set(MLT_TRANSITION_PROPERTIES(transition), "rect", "12 -7 160 90 0.6");
+            mlt_properties_set_int(MLT_TRANSITION_PROPERTIES(transition), "_gpufx.disable", cpu ? 1 : 0);
+            mlt_field_plant_transition(field, transition, 0, 1);
+            mlt_frame frame = nullptr;
+            mlt_service_get_frame(MLT_TRACTOR_SERVICE(tractor), &frame, 0);
+            if (frame) {
+                output = fetchOutput(frame, mlt_image_yuv422, profile->width, profile->height);
+                mlt_frame_close(frame);
+            }
+            mlt_transition_close(transition);
+            mlt_tractor_close(tractor);
+            mlt_filter_close(converter);
+            mlt_producer_close(producers[0]);
+            mlt_producer_close(producers[1]);
+            return output;
+        };
+        g_mock.reset();
+        const Output gpu = renderYuv(false);
+        const MockCudaStats stats = g_mock.stats();
+        const Output cpu = renderYuv(true);
+        expectSameOutput(cpu, gpu, "yuv422 output of compositing", 1);
+        if (g_mock.active()) {
+            const uint64_t pixels = uint64_t(profile->width) * uint64_t(profile->height);
+            check(stats.downloadedBytes == pixels * 3, "yuv422 output of compositing: %llu bytes downloaded", (unsigned long long)stats.downloadedBytes);
+        }
+    }
+}
+
 void testGlobalSwitch(mlt_profile profile)
 {
     if (!g_mock.active() || !hasFilter("dropshadow")) {
@@ -938,6 +1273,8 @@ int main(int argc, char **argv)
     testCompositing(profile);
     testChains(profile);
     testProducer(profile);
+    testDecoding(profile);
+    testYuvOutput(profile);
     testGlobalSwitch(profile);
     testFailures(profile);
 

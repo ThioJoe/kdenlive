@@ -99,6 +99,11 @@ QString MltConnection::gpuEffectsStatus(bool *available, QStringList *effects)
         for (const QString &transition : transitions) {
             effects->append(QStringLiteral("transition:") + transition);
         }
+        // Image conversions are listed as conversion:<service>
+        const QStringList conversions = QString::fromUtf8(status.get("conversions")).split(QLatin1Char(','), Qt::SkipEmptyParts);
+        for (const QString &conversion : conversions) {
+            effects->append(QStringLiteral("conversion:") + conversion);
+        }
     }
     if (!usable) {
         return i18n("Not available: %1", QString::fromUtf8(status.get("status")));

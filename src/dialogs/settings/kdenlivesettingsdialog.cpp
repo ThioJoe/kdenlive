@@ -714,7 +714,11 @@ void KdenliveSettingsDialog::initSdlPage(bool gpuAllowed)
         for (const QString &service : result.second) {
             if (service == QLatin1String("transition:qtblend")) {
                 names << i18n("Track compositing");
-            } else if (service.startsWith(QLatin1String("transition:"))) {
+            } else if (service == QLatin1String("conversion:avformat")) {
+                names << i18n("Video decoding to RGBA");
+            } else if (service == QLatin1String("conversion:avcolor_space")) {
+                names << i18n("Output conversion to YUV");
+            } else if (service.startsWith(QLatin1String("transition:")) || service.startsWith(QLatin1String("conversion:"))) {
                 names << service.section(QLatin1Char(':'), 1);
             } else {
                 names << (EffectsRepository::get()->exists(service) ? EffectsRepository::get()->getName(service) : service);

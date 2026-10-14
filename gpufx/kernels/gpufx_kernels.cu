@@ -965,3 +965,138 @@ GPUFX_KERNEL void gpufx_alpha_check(const gpufx_u32 *__restrict__ src, int n, in
         *transparent = 1;
     }
 }
+
+/* ==========================================================================
+ * Image format conversions that libswscale does for MLT, with the flags MLT
+ * picks (mlt_get_sws_flags()): 4:2:0 YUV decoded by the avformat producer to
+ * RGBA, and RGBA to packed 4:2:2 YUV (YUYV) for the consumer. This is the
+ * arithmetic of libswscale's C code (LGPL-2.1-or-later, FFmpeg developers),
+ * which its x86 SIMD code reproduces exactly for these paths. The
+ * coefficients and sampling positions come from gpufx/src/sws_port.cpp.
+ * ========================================================================== */
+
+// av_clip_uintp2(a, 30)
+GPUFX_DEV int gpufx_clip_uintp2_30(int a)
+{
+    if (a & ~((1 << 30) - 1)) {
+        return (~a) >> 31 & ((1 << 30) - 1);
+    }
+    return a;
+}
+
+/* 4:2:0 YUV (yuv420p, optionally with an alpha plane) to RGBA with SWS_POINT,
+ * SWS_ACCURATE_RND and SWS_FULL_CHR_H_INT. Each plane goes through the 15-bit
+ * intermediate (hScale8To15 with a single tap), then
+ * yuv2rgb_full_1_c_template() writes the pixels. columns and rows give the
+ * chroma sample of every pixel column and row. The alpha plane, if any, has
+ * the pitch of the luma plane. */
+GPUFX_KERNEL void gpufx_yuv420_to_rgba(const gpufx_u8 *__restrict__ luma, const gpufx_u8 *__restrict__ cb, const gpufx_u8 *__restrict__ cr,
+                                       const gpufx_u8 *__restrict__ alpha, int lumaPitch, int chromaPitch, const int *__restrict__ columns,
+                                       const int *__restrict__ rows, gpufx_u32 *__restrict__ dst, int w, int h, int yOffset, int yCoeff, int v2r,
+                                       int v2g, int u2g, int u2b)
+{
+    const int x = GPUFX_GLOBAL_X;
+    const int y = GPUFX_GLOBAL_Y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    const size_t pixel = size_t(y) * size_t(lumaPitch) + size_t(x);
+    const size_t chroma = size_t(rows[y]) * size_t(chromaPitch) + size_t(columns[x]);
+    int Y = int(luma[pixel]) << 7;
+    int U = int(cb[chroma]) << 7;
+    int V = int(cr[chroma]) << 7;
+
+    // yuv2rgb_full_1_c_template() without vertical chroma interpolation
+    Y *= 4;
+    U = (U - (128 << 7)) * 4;
+    V = (V - (128 << 7)) * 4;
+    // yuv2rgb_write_full()
+    Y -= yOffset;
+    Y *= yCoeff;
+    Y += 1 << 21;
+    int R = int(gpufx_u32(Y) + gpufx_u32(V) * gpufx_u32(v2r));
+    int G = int(gpufx_u32(Y) + gpufx_u32(V) * gpufx_u32(v2g) + gpufx_u32(U) * gpufx_u32(u2g));
+    int B = int(gpufx_u32(Y) + gpufx_u32(U) * gpufx_u32(u2b));
+    if ((R | G | B) & 0xC0000000) {
+        R = gpufx_clip_uintp2_30(R);
+        G = gpufx_clip_uintp2_30(G);
+        B = gpufx_clip_uintp2_30(B);
+    }
+    // (a << 7 + 64) >> 7 for the alpha plane
+    const gpufx_u32 A = alpha ? gpufx_u32(alpha[pixel]) : 255u;
+    dst[size_t(y) * size_t(w) + size_t(x)] = gpufx_pack(gpufx_u32(R >> 22), gpufx_u32(G >> 22), gpufx_u32(B >> 22), A);
+}
+
+/* rgb32ToY_c() for RGBA followed by hScale16To15 with a single tap: 15-bit
+ * luma. ry, gy and by come from input_rgb2yuv_table. */
+GPUFX_DEV int gpufx_sws_rgba_luma(gpufx_u32 px, int ry, int gy, int by)
+{
+    const int r = int(px & 0xFFu);
+    const int g = int(px & 0xFF00u);
+    const int b = int((px & 0xFF0000u) >> 16);
+    const gpufx_u32 rnd = (32u << 22) + (1u << 16);
+    const int y14 = int((gpufx_u32((ry << 8) * r + gy * g + (by << 8) * b) + rnd) >> 17);
+    return gpufx_min(y14 * 2, (1 << 15) - 1);
+}
+
+/* rgb32ToUV_half_c() for RGBA (the chroma of two neighbouring pixels)
+ * followed by hScale16To15 with a single tap: 15-bit chroma. */
+GPUFX_DEV int gpufx_sws_rgba_chroma(gpufx_u32 px0, gpufx_u32 px1, int cr, int cg, int cb)
+{
+    const gpufx_u32 g = (px0 & 0xFF00FF00u) + (px1 & 0xFF00FF00u);
+    const gpufx_u32 rb = px0 + px1 - g;
+    const int b = int((rb & 0x1FF0000u) >> 16);
+    const int gg = int(g & 0x1FF00u);
+    const int r = int(rb & 0x1FFu);
+    const gpufx_u32 rnd = (256u << 23) + (1u << 17);
+    const int c14 = int((gpufx_u32(cr * 256 * r + cg * gg + cb * 256 * b) + rnd) >> 18);
+    return gpufx_min(c14 * 2, (1 << 15) - 1);
+}
+
+/* RGBA to YUYV 4:2:2 with SWS_BICUBIC and SWS_ACCURATE_RND: the 15-bit
+ * values of gpufx_sws_rgba_luma() and gpufx_sws_rgba_chroma(), converted to
+ * full range by lumRangeToJpeg_c() and chrRangeToJpeg_c() when fullRange is
+ * set, written by yuv2422_1_c_template(). When alpha is not null the alpha
+ * channel is also copied there, one byte per pixel, as MLT's avcolour_space
+ * does. One thread per pair of pixels, the width must be even. */
+GPUFX_KERNEL void gpufx_rgba_to_yuyv422(const gpufx_u32 *__restrict__ src, gpufx_u8 *__restrict__ dst, gpufx_u8 *__restrict__ alpha, int w, int h,
+                                        int ry, int gy, int by, int ru, int gu, int bu, int rv, int gv, int bv, int fullRange)
+{
+    const int pair = GPUFX_GLOBAL_X;
+    const int y = GPUFX_GLOBAL_Y;
+    if (2 * pair >= w || y >= h) {
+        return;
+    }
+    const size_t index = size_t(y) * size_t(w) + size_t(2 * pair);
+    const gpufx_u32 p0 = src[index];
+    const gpufx_u32 p1 = src[index + 1];
+    int y0 = gpufx_sws_rgba_luma(p0, ry, gy, by);
+    int y1 = gpufx_sws_rgba_luma(p1, ry, gy, by);
+    int u = gpufx_sws_rgba_chroma(p0, p1, ru, gu, bu);
+    int v = gpufx_sws_rgba_chroma(p0, p1, rv, gv, bv);
+    if (fullRange) {
+        y0 = (gpufx_min(y0, 30189) * 19077 - 39057361) >> 14;
+        y1 = (gpufx_min(y1, 30189) * 19077 - 39057361) >> 14;
+        u = (gpufx_min(u, 30775) * 4663 - 9289992) >> 12;
+        v = (gpufx_min(v, 30775) * 4663 - 9289992) >> 12;
+    }
+    int Y1 = (y0 + 64) >> 7;
+    int Y2 = (y1 + 64) >> 7;
+    int U = (u + 64) >> 7;
+    int V = (v + 64) >> 7;
+    if ((Y1 | Y2 | U | V) & 0x100) {
+        Y1 = gpufx_clamp(Y1, 0, 255);
+        Y2 = gpufx_clamp(Y2, 0, 255);
+        U = gpufx_clamp(U, 0, 255);
+        V = gpufx_clamp(V, 0, 255);
+    }
+    gpufx_u8 *out = dst + index * 2;
+    out[0] = gpufx_u8(Y1);
+    out[1] = gpufx_u8(U);
+    out[2] = gpufx_u8(Y2);
+    out[3] = gpufx_u8(V);
+    if (alpha) {
+        alpha[index] = gpufx_u8(p0 >> 24);
+        alpha[index + 1] = gpufx_u8(p1 >> 24);
+    }
+}
